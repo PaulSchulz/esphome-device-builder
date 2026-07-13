@@ -851,6 +851,46 @@ def test_on_ip_change_skips_when_ip_unchanged(
     assert spawned == []
 
 
+async def test_on_persisted_ip_invalidated_clears_disk_and_device(
+    tmp_path: Path,
+    make_controller: MakeControllerFactory,
+    capture_devices_events: CaptureDevicesEventsFactory,
+) -> None:
+    """The reviver's mismatch verdict clears ``device.ip``, the store entry, and fires an update."""
+    controller = make_controller(tmp_path)
+    device = _device("kitchen", ip="192.168.1.42")
+    controller._scanner._devices_by_name = {"kitchen": [device]}  # type: ignore[attr-defined]
+    controller._metadata_store.update("kitchen.yaml", ip="192.168.1.42")
+    captured = capture_devices_events(controller, EventType.DEVICE_UPDATED)
+
+    controller._on_persisted_ip_invalidated("kitchen", "192.168.1.42")
+
+    assert device.ip == ""
+    assert "ip" not in controller._metadata_store.get("kitchen.yaml")
+    assert len(captured) == 1
+
+    # A device no longer holding the proven-stale IP is a no-op.
+    controller._on_persisted_ip_invalidated("kitchen", "192.168.1.42")
+    assert len(captured) == 1
+
+
+async def test_on_persisted_ip_invalidated_spares_same_name_siblings(
+    tmp_path: Path,
+    make_controller: MakeControllerFactory,
+) -> None:
+    """The clear is scoped to the proven-stale IP; a sibling's own IP survives."""
+    controller = make_controller(tmp_path)
+    dialed = _device("kitchen", ip="192.168.1.42")
+    sibling = _device("kitchen", ip="192.168.1.99")
+    sibling.configuration = "kitchen (1).yaml"
+    controller._scanner._devices_by_name = {"kitchen": [dialed, sibling]}  # type: ignore[attr-defined]
+
+    controller._on_persisted_ip_invalidated("kitchen", "192.168.1.42")
+
+    assert dialed.ip == ""
+    assert sibling.ip == "192.168.1.99"
+
+
 # ---------------------------------------------------------------------------
 # _on_firmware_job_completed early-return branches
 # ---------------------------------------------------------------------------

@@ -34,10 +34,12 @@ from esphome_device_builder.controllers._device_state_monitor import mdns as mdn
 from esphome_device_builder.controllers._device_state_monitor import ping as ping_module
 from esphome_device_builder.controllers._device_state_monitor._state import MonitorState
 from esphome_device_builder.controllers._device_state_monitor.api_info import ApiInfoSource
+from esphome_device_builder.controllers._device_state_monitor.api_reviver import ApiReviverSource
 from esphome_device_builder.controllers._device_state_monitor.importable import ImportableDiscovery
 from esphome_device_builder.controllers._device_state_monitor.mdns import MdnsSource
 from esphome_device_builder.controllers._device_state_monitor.ping import PingSource
 from esphome_device_builder.controllers._reachability_tracker import ReachabilityTracker
+from esphome_device_builder.helpers.async_ import log_task_exit
 from esphome_device_builder.models import RUNTIME_STATE_FIELD_NAMES, Device, DeviceState
 
 from .conftest import RecordingMonitorCallbacks, stub_async_service_info
@@ -78,9 +80,12 @@ def _make_monitor(
     monitor._mdns = MdnsSource(monitor)
 
     monitor._presence = None  # ping loop runs unconditionally in tests
+    monitor._api_dial_budget = asyncio.Semaphore(1)
     monitor._ping = PingSource(monitor)
     monitor._api_info = ApiInfoSource(monitor)
+    monitor._api_reviver = ApiReviverSource(monitor)
     monitor._resolve_api_connection = None
+    monitor._on_persisted_ip_invalidated = None
     monitor._get_devices = lambda: devices
     monitor._get_devices_by_name = lambda name: [d for d in devices if d.name == name]
     monitor._is_ignored = lambda _name: False
@@ -90,6 +95,7 @@ def _make_monitor(
     monitor._mdns._mdns_browser = None
     monitor._ping_task = None
     monitor._api_info_task = None
+    monitor._api_reviver_task = None
     monitor._tasks = set()
     monitor._importable._import_discovery = None
 
@@ -261,7 +267,7 @@ async def test_interface_monitor_done_callback_logs_unexpected_crash(
         await task
 
     with caplog.at_level(logging.ERROR):
-        MdnsSource._log_interface_monitor_exit(task)
+        log_task_exit("Interface monitor", task)
 
     assert "Interface monitor loop crashed" in caplog.text
 
@@ -281,7 +287,7 @@ async def test_interface_monitor_done_callback_silent_on_cancel(
         await task
 
     with caplog.at_level(logging.ERROR):
-        MdnsSource._log_interface_monitor_exit(task)
+        log_task_exit("Interface monitor", task)
 
     assert caplog.text == ""
 
@@ -364,18 +370,21 @@ async def test_close_zeroconf_is_bounded_when_async_close_hangs(
 
 
 async def test_stop_drains_ping_and_api_info_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
-    """stop() awaits the cancelled ping / API-info tasks, not leaving them for aiohttp's sweep."""
+    """stop() awaits the cancelled ping / API tasks, not leaving them for aiohttp's sweep."""
     monitor, _callbacks = _make_monitor()
     await _start_with_captured_dispatch(monitor, monkeypatch)
     ping = monitor._ping_task
     api = monitor._api_info_task
+    reviver = monitor._api_reviver_task
     assert ping is not None
     assert api is not None
+    assert reviver is not None
 
     await monitor.stop()
 
     assert ping.done()
     assert api.done()
+    assert reviver.done()
 
 
 # ---------------------------------------------------------------------------

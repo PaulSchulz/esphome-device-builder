@@ -13,7 +13,10 @@ Source precedence (highest first): ``mdns`` > ``mqtt`` > ``ping``. A
 lower-priority source can never override the state set by a higher one.
 A separate Native API fallback fills ``mac_address`` / ``deployed_version``
 for online API devices mDNS hasn't reached; it never drives ONLINE/OFFLINE
-and so stays out of the precedence ledger.
+and so stays out of the precedence ledger. The API reviver is the one
+Native API path that does drive state: it revives a stuck-offline device
+from its persisted IP after identity verification, claiming under the
+``ping`` source.
 """
 
 from __future__ import annotations
@@ -22,11 +25,12 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Any
 
 from esphome.zeroconf import AsyncEsphomeZeroconf
 
-from ...helpers.async_ import create_eager_task
+from ...helpers.async_ import create_eager_task, drain_tasks, log_task_exit
 from ...helpers.subscriber_presence import SubscriberPresence
 from ...models import (
     RUNTIME_STATE_FIELD_NAMES,
@@ -39,6 +43,7 @@ from .._reachability_tracker import MdnsCacheInfo, ReachabilityTracker
 from .._task_controller_base import TaskControllerBase
 from ._state import MonitorState
 from .api_info import ApiInfoSource
+from .api_reviver import ApiReviverSource
 from .helpers import (
     _normalize_mac,
     _pick_ipv4,
@@ -105,6 +110,14 @@ ImportableRemovedCallback = Callable[[str], None]
 # device; an empty key means "connect plaintext".
 ApiConnectionResolver = Callable[[str], Awaitable[tuple[str, int]]]
 
+# Persisted-IP invalidation, ``(name, stale_ip)``: the API reviver
+# proved the on-disk last-known *stale_ip* now belongs to a different
+# device, so the owner must clear it (``on_ip_change`` deliberately
+# keeps last-known on disk). Carrying the proven IP scopes the clear —
+# a same-name sibling holding a different IP, or an IP mDNS re-learned
+# mid-dial, stays untouched.
+PersistedIpInvalidatedCallback = Callable[[str, str], None]
+
 
 class DeviceStateMonitor(TaskControllerBase):  # noqa: PLR0904 (grandfathered; new public methods need a refactor first)
     """
@@ -132,6 +145,7 @@ class DeviceStateMonitor(TaskControllerBase):  # noqa: PLR0904 (grandfathered; n
         presence: SubscriberPresence | None = None,
         resolve_api_connection: ApiConnectionResolver | None = None,
         on_source_change: SourceChangeCallback | None = None,
+        on_persisted_ip_invalidated: PersistedIpInvalidatedCallback | None = None,
     ) -> None:
         super().__init__()
         self._get_devices = get_devices
@@ -155,9 +169,11 @@ class DeviceStateMonitor(TaskControllerBase):  # noqa: PLR0904 (grandfathered; n
         self._on_importable_removed = on_importable_removed
         self._is_ignored = is_ignored or (lambda _name: False)
         self._resolve_api_connection = resolve_api_connection
+        self._on_persisted_ip_invalidated = on_persisted_ip_invalidated
         self.state = MonitorState(reachability=reachability)
         self._ping_task: asyncio.Task | None = None
         self._api_info_task: asyncio.Task | None = None
+        self._api_reviver_task: asyncio.Task | None = None
         # ``self._tasks`` (fire-and-forget mDNS resolve refs) is
         # inherited from :class:`TaskControllerBase`.
         # When wired, the ping loop pauses while no dashboard client
@@ -167,34 +183,42 @@ class DeviceStateMonitor(TaskControllerBase):  # noqa: PLR0904 (grandfathered; n
         # without a presence gate keep working.
         self._presence = presence
         self._importable = ImportableDiscovery(self)
+        # One Native API worker dial at a time across every API source
+        # (api_info + reviver): each dial spawns an interpreter and
+        # occupies one of a device's scarce API connection slots.
+        self._api_dial_budget = asyncio.Semaphore(1)
         self._mdns = MdnsSource(self)
         self._ping = PingSource(self)
         self._api_info = ApiInfoSource(self)
+        self._api_reviver = ApiReviverSource(self)
 
     async def start(self) -> None:
-        """Start the mDNS browser, the periodic ping sweep, and the API info fallback."""
+        """Start the mDNS browser, the ping sweep, the API info fallback, and the reviver."""
         await self._mdns.start()
         self._ping_task = asyncio.create_task(self._ping.run())
+        self._ping_task.add_done_callback(partial(log_task_exit, "Ping sweep"))
         self._api_info_task = asyncio.create_task(self._api_info.run())
-        self._api_info_task.add_done_callback(self._log_api_info_task_exit)
+        self._api_info_task.add_done_callback(partial(log_task_exit, "API info fallback"))
+        self._api_reviver_task = asyncio.create_task(self._api_reviver.run())
+        self._api_reviver_task.add_done_callback(partial(log_task_exit, "API reviver"))
 
     async def stop(self) -> None:
-        """Tear down the browser and drain the ping + API-info + resolve tasks (bounded)."""
+        """Tear down the browser and drain the ping + API + resolve tasks (bounded)."""
         drain: list[asyncio.Task[Any]] = []
-        if self._ping_task is not None:
-            self._ping_task.cancel()
-            drain.append(self._ping_task)
-            self._ping_task = None
-        if self._api_info_task is not None:
-            self._api_info_task.cancel()
-            drain.append(self._api_info_task)
-            self._api_info_task = None
+        # Cancel the loop tasks eagerly — before the ``cancel_browser``
+        # await below — so a mid-sweep loop can't resume and spawn new
+        # work (a 15s worker subprocess, state applies) during teardown.
+        # ``drain_tasks`` re-cancelling later is a no-op.
+        for attr in ("_ping_task", "_api_info_task", "_api_reviver_task"):
+            task: asyncio.Task | None = getattr(self, attr)
+            if task is not None:
+                task.cancel()
+                drain.append(task)
+                setattr(self, attr, None)
         # Cancel the browser FIRST so it stops dispatching new mDNS
         # callbacks; otherwise the drain below would race against
         # newly-spawned resolve tasks the browser is still firing.
         await self._mdns.cancel_browser()
-        for task in self._tasks:
-            task.cancel()
         drain.extend(self._tasks)
         self._tasks.clear()
         # Close zeroconf eagerly so 5353 frees now, overlapping the task drain.
@@ -203,18 +227,8 @@ class DeviceStateMonitor(TaskControllerBase):  # noqa: PLR0904 (grandfathered; n
             # Drain bounded here so the cancelled tasks don't leak to aiohttp's
             # unbounded terminal sweep.
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    asyncio.gather(*drain, return_exceptions=True), _STOP_DRAIN_TIMEOUT
-                )
+                await asyncio.wait_for(drain_tasks(drain), _STOP_DRAIN_TIMEOUT)
         await close
-
-    @staticmethod
-    def _log_api_info_task_exit(task: asyncio.Task) -> None:
-        """Surface an unexpected API-info loop crash instead of letting it die silently."""
-        if task.cancelled():
-            return
-        if (exc := task.exception()) is not None:
-            _LOGGER.error("API info fallback loop crashed: %s", exc, exc_info=exc)
 
     @property
     def zeroconf(self) -> AsyncEsphomeZeroconf | None:

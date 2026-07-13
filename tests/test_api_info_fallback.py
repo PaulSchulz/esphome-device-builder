@@ -15,7 +15,6 @@ import asyncio
 import io
 import json
 import logging
-import time
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -23,9 +22,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from esphome_device_builder.controllers._device_state_monitor import DeviceStateMonitor
+from esphome_device_builder.controllers._device_state_monitor import (
+    _api_probe as api_probe_module,
+)
 from esphome_device_builder.controllers._device_state_monitor import api_info as api_info_module
+from esphome_device_builder.controllers._device_state_monitor._api_probe import ProbeError
 from esphome_device_builder.controllers._device_state_monitor.api_info import ApiInfoSource
 from esphome_device_builder.helpers import api_device_info
+from esphome_device_builder.helpers.async_ import log_task_exit
 from esphome_device_builder.helpers.subprocess import CapturedSubprocess
 from esphome_device_builder.models import Device, DeviceState, ReachabilitySource
 
@@ -364,7 +368,8 @@ async def test_sweep_prunes_cooldown_for_removed_devices() -> None:
     device = make_online_api_device()
     monitor, _ = make_state_monitor_with_callbacks([device])
     src = monitor._api_info
-    src._cooldown = {"ghost": 1e18, "kitchen": 1e18}
+    src._cooldown.set("ghost", 1e18)
+    src._cooldown.set("kitchen", 1e18)
     src._fetch = AsyncMock()  # type: ignore[method-assign]
 
     await src._sweep()
@@ -383,10 +388,10 @@ async def test_run_without_aioesphomeapi_still_sweeps(monkeypatch: Any) -> None:
     monitor, _ = make_state_monitor_with_callbacks([make_online_api_device()])
     src = monitor._api_info
     monkeypatch.setattr(
-        "esphome_device_builder.controllers._device_state_monitor.api_info.importlib.util.find_spec",
+        "esphome_device_builder.controllers._device_state_monitor._api_probe.importlib.util.find_spec",
         lambda _name: None,
     )
-    monkeypatch.setattr(api_info_module, "_BOOTSTRAP_DELAY", 0)
+    monkeypatch.setattr(ApiInfoSource, "_bootstrap_delay", 0)
     sweep = AsyncMock()
 
     async def _idle() -> None:
@@ -439,7 +444,7 @@ async def test_run_sweeps_then_idles(monkeypatch: Any) -> None:
     """With aioesphomeapi present the loop bootstraps, sweeps, then idles each cycle."""
     monitor, _ = make_state_monitor_with_callbacks([])
     src = monitor._api_info
-    monkeypatch.setattr(api_info_module, "_BOOTSTRAP_DELAY", 0)
+    monkeypatch.setattr(ApiInfoSource, "_bootstrap_delay", 0)
     swept: list[int] = []
 
     async def _sweep() -> None:
@@ -460,7 +465,7 @@ async def test_run_survives_a_sweep_error(monkeypatch: Any) -> None:
     """An unexpected error from a sweep is logged and the loop keeps going."""
     monitor, _ = make_state_monitor_with_callbacks([])
     src = monitor._api_info
-    monkeypatch.setattr(api_info_module, "_BOOTSTRAP_DELAY", 0)
+    monkeypatch.setattr(ApiInfoSource, "_bootstrap_delay", 0)
     reached_idle: list[int] = []
 
     async def _boom_sweep() -> None:
@@ -502,7 +507,7 @@ async def test_run_waits_for_subscriber_when_presence_wired(monkeypatch: Any) ->
     )
     assert presence.callbacks  # ApiInfoSource registered its wake on construction
     src = monitor._api_info
-    monkeypatch.setattr(api_info_module, "_BOOTSTRAP_DELAY", 0)
+    monkeypatch.setattr(ApiInfoSource, "_bootstrap_delay", 0)
     swept: list[int] = []
 
     async def _sweep() -> None:
@@ -528,7 +533,7 @@ async def test_idle_returns_immediately_when_woken() -> None:
 
 async def test_idle_times_out_when_not_woken(monkeypatch: Any) -> None:
     """With no wake, the idle wait expires after the interval and returns."""
-    monkeypatch.setattr(api_info_module, "_INTERVAL", 0.01)
+    monkeypatch.setattr(api_probe_module, "_INTERVAL", 0.01)
     monitor, _ = make_state_monitor_with_callbacks([])
     await monitor._api_info._idle()
 
@@ -738,7 +743,7 @@ def _patch_capture(
                 returncode=returncode, stdout=stdout, timed_out=timed_out
             )
         )
-    monkeypatch.setattr(api_info_module, "run_subprocess_capture", mock)
+    monkeypatch.setattr(api_probe_module, "run_subprocess_capture", mock)
     return mock
 
 
@@ -759,21 +764,32 @@ async def test_run_worker_feeds_request_over_stdin_with_stderr_discarded(monkeyp
     assert kwargs["merge_stderr"] is False
 
 
+async def test_run_worker_returns_none_on_device_side_miss(monkeypatch: Any) -> None:
+    """A worker that ran its protocol but got refused maps to ``None``."""
+    monitor, _ = make_state_monitor_with_callbacks([])
+    _patch_capture(monkeypatch, returncode=1, stdout=b"{}")
+    assert await monitor._api_info._run_worker(make_device(), b"{}") is None
+
+
 @pytest.mark.parametrize(
     "capture_kwargs",
     [
-        pytest.param({"returncode": 1, "stdout": b"{}"}, id="nonzero_exit"),
         pytest.param({"stdout": b""}, id="empty_stdout"),
+        pytest.param({"returncode": 0, "stdout": b"[]"}, id="non_dict_payload"),
         pytest.param({"returncode": None, "timed_out": True}, id="timeout"),
         pytest.param({"stdout": b"not json"}, id="unparsable_stdout"),
         pytest.param({"error": OSError("cannot exec")}, id="spawn_oserror"),
     ],
 )
-async def test_run_worker_returns_none(monkeypatch: Any, capture_kwargs: dict[str, Any]) -> None:
-    """Every non-success worker outcome maps to a missed probe (``None``)."""
+async def test_run_worker_raises_transient_on_host_side_miss(
+    monkeypatch: Any, capture_kwargs: dict[str, Any]
+) -> None:
+    """Host-side misses say nothing about the device; they raise transient."""
     monitor, _ = make_state_monitor_with_callbacks([])
     _patch_capture(monkeypatch, **capture_kwargs)
-    assert await monitor._api_info._run_worker(make_device(), b"{}") is None
+    with pytest.raises(ProbeError) as excinfo:
+        await monitor._api_info._run_worker(make_device(), b"{}")
+    assert excinfo.value.transient
 
 
 async def test_run_worker_propagates_cancellation(monkeypatch: Any) -> None:
@@ -795,6 +811,16 @@ async def test_run_worker_logs_worker_reported_error(monkeypatch: Any, caplog: A
     assert "connection refused" in caplog.text
 
 
+async def test_sweep_source_base_defaults() -> None:
+    """The base runs unconditionally by default and demands a ``_sweep``."""
+    monitor, _ = make_state_monitor_with_callbacks([])
+    base = api_probe_module.ApiSweepSource(monitor)
+
+    assert base._prepare() is True
+    with pytest.raises(NotImplementedError):
+        await base._sweep()
+
+
 # ----------------------------------------------------------------------
 # Subprocess worker module (esphome_device_builder.helpers.api_device_info)
 # ----------------------------------------------------------------------
@@ -810,8 +836,10 @@ def _fake_api_client(
     return client
 
 
-async def test_worker_fetch_returns_mac_and_version(monkeypatch: Any) -> None:
-    info = SimpleNamespace(mac_address="AA:BB:CC:DD:EE:FF", esphome_version="2026.6.1")
+async def test_worker_fetch_returns_name_mac_and_version(monkeypatch: Any) -> None:
+    info = SimpleNamespace(
+        name="kitchen", mac_address="AA:BB:CC:DD:EE:FF", esphome_version="2026.6.1"
+    )
     client = _fake_api_client(info=info)
     monkeypatch.setattr("aioesphomeapi.APIClient", MagicMock(return_value=client))
 
@@ -819,7 +847,11 @@ async def test_worker_fetch_returns_mac_and_version(monkeypatch: Any) -> None:
         {"address": "1.2.3.4", "port": 6053, "noise_psk": "", "addresses": ["1.2.3.4"]}
     )
 
-    assert result == {"mac_address": "AA:BB:CC:DD:EE:FF", "esphome_version": "2026.6.1"}
+    assert result == {
+        "name": "kitchen",
+        "mac_address": "AA:BB:CC:DD:EE:FF",
+        "esphome_version": "2026.6.1",
+    }
     client.connect.assert_awaited_once()
     client.disconnect.assert_awaited_once()
 
@@ -856,13 +888,16 @@ def test_worker_main_writes_json_on_success(monkeypatch: Any, capsys: Any) -> No
             )
         ),
     )
-    info = SimpleNamespace(mac_address="AA:BB:CC:DD:EE:FF", esphome_version="2026.6.1")
+    info = SimpleNamespace(
+        name="kitchen", mac_address="AA:BB:CC:DD:EE:FF", esphome_version="2026.6.1"
+    )
     monkeypatch.setattr(
         "aioesphomeapi.APIClient", MagicMock(return_value=_fake_api_client(info=info))
     )
 
     assert api_device_info.main() == 0
     assert json.loads(capsys.readouterr().out) == {
+        "name": "kitchen",
         "mac_address": "AA:BB:CC:DD:EE:FF",
         "esphome_version": "2026.6.1",
     }
@@ -876,7 +911,7 @@ def test_worker_main_writes_json_on_success(monkeypatch: Any, capsys: Any) -> No
 def test_log_task_exit_ignores_cancelled() -> None:
     task = MagicMock()
     task.cancelled.return_value = True
-    DeviceStateMonitor._log_api_info_task_exit(task)
+    log_task_exit("API info fallback", task)
     task.exception.assert_not_called()
 
 
@@ -884,7 +919,7 @@ def test_log_task_exit_noop_without_exception() -> None:
     task = MagicMock()
     task.cancelled.return_value = False
     task.exception.return_value = None
-    DeviceStateMonitor._log_api_info_task_exit(task)  # must not raise
+    log_task_exit("API info fallback", task)  # must not raise
 
 
 def test_log_task_exit_logs_crash(caplog: Any) -> None:
@@ -892,7 +927,7 @@ def test_log_task_exit_logs_crash(caplog: Any) -> None:
     task.cancelled.return_value = False
     task.exception.return_value = RuntimeError("loop died")
     with caplog.at_level(logging.ERROR):
-        DeviceStateMonitor._log_api_info_task_exit(task)
+        log_task_exit("API info fallback", task)
     assert "API info fallback loop crashed" in caplog.text
 
 
@@ -916,7 +951,7 @@ def test_request_reprobe_bypasses_cooldown() -> None:
     device = make_online_api_device()
     monitor, _ = make_state_monitor_with_callbacks([device])
     src = monitor._api_info
-    src._cooldown["kitchen"] = time.monotonic() + 600
+    src._cooldown.set("kitchen", 600)
     assert src._select_targets() == []  # parked on cooldown
     src.request_reprobe("kitchen")
     assert [d.name for d in src._select_targets()] == ["kitchen"]
