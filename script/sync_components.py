@@ -3624,18 +3624,73 @@ def _build_id_entry(key: str, raw: dict, *, required: bool = False) -> dict:
     }
 
 
-def _build_options(raw: dict) -> list[dict] | None:
-    """Build a list of ``{label, value}`` dicts from a schema's enum values."""
+# The three upstream default-marker idioms: a trailing ``*(default)*``,
+# a leading ``(Default)``, or docs that are nothing but ``Default``.
+_DEFAULT_MARKER_RE = re.compile(
+    r"\s*\*\(default\)\*\s*$|^\(default\)[\s:.]*|^\(?default\)?\.?$", re.IGNORECASE
+)
+
+
+def _split_default_marker(docs: str) -> tuple[str, bool]:
+    """Strip any default-marker idiom, reporting whether one was present."""
+    docs = docs.strip()
+    stripped = _DEFAULT_MARKER_RE.sub("", docs).strip()
+    return stripped, stripped != docs
+
+
+# Docs longer than a dropdown row can't work as a label even without
+# terminal punctuation (truncated upstream docstrings hit this).
+_MAX_OPTION_LABEL_LENGTH = 60
+
+
+def _is_sentence_docs(docs: str) -> bool:
+    """Whether *docs* reads as sentence prose rather than an option label."""
+    docs = docs.rstrip()
+    return len(docs) > _MAX_OPTION_LABEL_LENGTH or docs.endswith((".", "!", "?"))
+
+
+def _enum_default(raw: dict) -> str | None:
+    """Resolve the schema-marked default among an enum's values."""
     values = raw.get("values")
     if not isinstance(values, dict):
         return None
+    for value, info in values.items():
+        if isinstance(info, dict) and (
+            info.get("default") or _split_default_marker(info.get("docs") or "")[1]
+        ):
+            return value
+    return None
+
+
+def _build_options(raw: dict) -> list[dict] | None:
+    """
+    Build a list of ``{label, value[, description]}`` dicts from a schema's enum values.
+
+    Label-like docs replace the label; sentence prose lands in
+    ``description``.
+    """
+    values = raw.get("values")
+    if not isinstance(values, dict):
+        return None
+    stripped_docs = {
+        value: _split_default_marker(info["docs"])[0]
+        for value, info in values.items()
+        if isinstance(info, dict) and info.get("docs")
+    }
+    # Classify per enum, not per value: one sentence-styled sibling means
+    # the docs are prose, and a menu mixing value labels with docs labels
+    # is wrong either way (sensor.pid's ERROR vs its sibling terms).
+    demote_all = any(_is_sentence_docs(docs) for docs in stripped_docs.values())
     options: list[dict] = []
     for value, info in values.items():
         label = value or "(none)"
         option = {"label": label, "value": value}
         if isinstance(info, dict):
-            if info.get("docs"):
-                option["label"] = info["docs"]
+            if docs := stripped_docs.get(value, ""):
+                if demote_all:
+                    option["description"] = _clean_description_text(docs)
+                else:
+                    option["label"] = docs
             # variant_enum: each value carries the variants that accept it;
             # lowercase to match the board catalog ``esphome.variant`` form.
             if variants := info.get("variants"):
@@ -3661,8 +3716,9 @@ def _coerce_default(value: Any) -> Any:
 def _extract_default(raw: dict, key: str = "") -> tuple[Any, str | None]:
     """Resolve ``(default_value, depends_on_component)`` for a field.
 
-    Reads ``default_with`` (``cv.OnlyWith``, esphome/esphome#16276)
-    in preference to plain ``default``. ``default_without``
+    Precedence: ``default_with`` (``cv.OnlyWith``,
+    esphome/esphome#16276), then plain ``default``, then an enum
+    value marked default (:func:`_enum_default`). ``default_without``
     (``cv.OnlyWithout``) has inverse-gate semantics that
     ``depends_on_component`` can't model — no default surfaces for
     those fields. Multi-component ``default_with`` picks the first
@@ -3680,7 +3736,10 @@ def _extract_default(raw: dict, key: str = "") -> tuple[Any, str | None]:
                 components[0],
             )
         return _coerce_default(gated.get("value")), components[0] if components else None
-    return _coerce_default(raw.get("default")), None
+    default = _coerce_default(raw.get("default"))
+    if default is None:
+        default = _enum_default(raw)
+    return default, None
 
 
 def _reference_namespace(qualified: str) -> str | None:
