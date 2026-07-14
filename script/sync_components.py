@@ -718,6 +718,19 @@ _FIELD_OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
     },
 }
 
+# Field paths whose live ``vol.Range`` max is derived from the machine
+# running the sync. ``esphome.compile_process_limit`` is
+# ``cv.int_range(min=1, max=get_usable_cpu_count())`` upstream, so the
+# walked bound is the sync runner's core count, not the user's compile
+# host, and churns between regens on different hardware. The wire
+# ``range`` is a closed pair with no min-only form, so these ship fully
+# unbounded; upstream validates against the real count at compile time.
+# Keyed on the bare introspection id (``stem if domain else top_key``),
+# so an entry for a platform stem applies across every domain sharing it.
+_MACHINE_DERIVED_RANGE_FIELDS: set[tuple[str, tuple[str, ...]]] = {
+    ("esphome", ("compile_process_limit",)),
+}
+
 # UART ``bus_constraints`` the schema can't express, filled into the captured
 # constraints (captured wins). Keyed by the catalog id whose "+ Add UART" detour
 # reads it. A scalar is a fixed rate; a list narrows the detour's baud combo box
@@ -4565,7 +4578,9 @@ def introspect_component(component_id: str) -> dict[str, Any]:
 
     refined_types = merge_from_platforms(_collect_refined_types)
     platform_constraints = merge_from_platforms(_collect_platform_constraints)
-    field_ranges = merge_from_platforms(_collect_field_ranges)
+    field_ranges = _drop_machine_derived_ranges(
+        component_id, merge_from_platforms(_collect_field_ranges)
+    )
     inclusive_groups = merge_from_platforms(_collect_inclusive_groups)
     required_groups = merge_from_platforms(_collect_required_groups)
     list_fields = merge_from_platforms(_collect_list_fields)
@@ -7237,6 +7252,26 @@ def _collect_field_ranges(
 
     _walk_schema_keys(schema, visit)
     return out
+
+
+def _drop_machine_derived_ranges(
+    component_id: str,
+    field_ranges: dict[tuple[str, ...], tuple[int | float, int | float]],
+) -> dict[tuple[str, ...], tuple[int | float, int | float]]:
+    """Strip bounds the sync runner's hardware chose (``_MACHINE_DERIVED_RANGE_FIELDS``)."""
+    denylisted = {path for owner, path in _MACHINE_DERIVED_RANGE_FIELDS if owner == component_id}
+    if not denylisted:
+        return field_ranges
+    for path in denylisted - field_ranges.keys():
+        # Same staleness posture as the disjoint-range warning: surface
+        # a curated entry upstream no longer justifies.
+        _LOGGER.warning(
+            "machine-derived range entry %s.%s no longer walks a bound; "
+            "drop it from _MACHINE_DERIVED_RANGE_FIELDS",
+            component_id,
+            ".".join(path),
+        )
+    return {path: bounds for path, bounds in field_ranges.items() if path not in denylisted}
 
 
 def _platform_field_keys(platform_manifests: list[Any]) -> set[tuple[str, ...]]:
