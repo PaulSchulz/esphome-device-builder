@@ -5398,6 +5398,62 @@ def _extract_validator_units(validator: Any) -> list[str] | None:
     ]
 
 
+# What a unit symbol embedded in a suffix-strip validator may look like:
+# short, no whitespace, unit charset only ("steps/s", "steps/s^2").
+_SUFFIX_UNIT_RE = re.compile(r"^[A-Za-z°µΩ%][A-Za-z0-9°µΩ%/^*()]{0,15}$")
+
+
+def _derive_suffix_units(validator: Any) -> list[str] | None:
+    """
+    Units of a hand-rolled ``"<float> <unit>"`` suffix validator, else None.
+
+    Recovers what the closure introspection and ``cv.<name>`` tables can't
+    see (stepper's ``validate_speed``). Every accepted spelling ships,
+    tuple order (canonical) first, so any YAML spelling still parses.
+    """
+    code = getattr(validator, "__code__", None)
+    if code is None:
+        return None
+    # Suffix candidates survive in the code constants. The const-tuple gate
+    # is what keeps this pass from calling arbitrary unclassified validators.
+    candidates = [
+        s
+        for const in code.co_consts
+        if isinstance(const, tuple)
+        for s in const
+        if isinstance(s, str) and _SUFFIX_UNIT_RE.match(s)
+    ]
+    # A validator that accepts arbitrary text would pass every suffix probe;
+    # require it to reject an unknown unit before trusting any acceptance.
+    if not candidates or _probe_number(validator, "5nosuchunitxyz") is not None:
+        return None
+    bare = _probe_number(validator, "5")
+    units: list[str] = []
+    for unit in dict.fromkeys(candidates):
+        with_unit = _probe_number(validator, f"5{unit}")
+        if with_unit is None:
+            continue
+        # A suffix that rescales the bare form (as5600's "5°" → raw counts)
+        # is a conversion, not a display unit. When the bare form doesn't
+        # parse there is no bare YAML to misdisplay, so the magnitude gate
+        # applies only when both forms do.
+        if bare is not None and bare != with_unit:
+            return None
+        units.append(unicodedata.normalize(_UNIT_NORMALIZATION, unit))
+    return units or None
+
+
+def _probe_number(validator: Any, text: str) -> float | None:
+    """``validator(text)`` as a float, or ``None`` when it raises or returns non-numeric."""
+    try:
+        result = validator(text)
+    except Exception:
+        return None
+    if isinstance(result, (int, float)) and not isinstance(result, bool):
+        return float(result)
+    return None
+
+
 def _validator_branches_dict_and_list(src: str) -> bool:
     """Report whether *src* tests both ``isinstance(_, dict)`` and ``isinstance(_, list)``."""
     try:
@@ -5528,6 +5584,11 @@ def _collect_refined_types(  # noqa: C901
         for k, t in by_name.items():
             if k in name:
                 return t
+        # Last resort: component-local suffix strippers (stepper's
+        # ``validate_speed``) that no table can bind (#2056).
+        units = _derive_suffix_units(validator)
+        if units:
+            return RefinedType("float_with_unit", unit_options=units)
         return None
 
     def visit(_key: Any, _key_name: str, val: Any, path: tuple[str, ...]) -> None:
