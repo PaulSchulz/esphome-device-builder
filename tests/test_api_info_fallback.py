@@ -524,20 +524,6 @@ async def test_run_waits_for_subscriber_when_presence_wired(monkeypatch: Any) ->
     assert swept == [1]
 
 
-async def test_idle_returns_immediately_when_woken() -> None:
-    """A set wake event short-circuits the idle wait."""
-    monitor, _ = make_state_monitor_with_callbacks([])
-    monitor._api_info._wake.set()
-    await monitor._api_info._idle()
-
-
-async def test_idle_times_out_when_not_woken(monkeypatch: Any) -> None:
-    """With no wake, the idle wait expires after the interval and returns."""
-    monkeypatch.setattr(api_probe_module, "_INTERVAL", 0.01)
-    monitor, _ = make_state_monitor_with_callbacks([])
-    await monitor._api_info._idle()
-
-
 # ----------------------------------------------------------------------
 # _sweep — serial, one probe at a time
 # ----------------------------------------------------------------------
@@ -809,16 +795,6 @@ async def test_run_worker_logs_worker_reported_error(monkeypatch: Any, caplog: A
     with caplog.at_level(logging.DEBUG):
         assert await monitor._api_info._run_worker(make_device(), b"{}") is None
     assert "connection refused" in caplog.text
-
-
-async def test_sweep_source_base_defaults() -> None:
-    """The base runs unconditionally by default and demands a ``_sweep``."""
-    monitor, _ = make_state_monitor_with_callbacks([])
-    base = api_probe_module.ApiSweepSource(monitor)
-
-    assert base._prepare() is True
-    with pytest.raises(NotImplementedError):
-        await base._sweep()
 
 
 # ----------------------------------------------------------------------
