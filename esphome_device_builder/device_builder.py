@@ -405,6 +405,7 @@ class DeviceBuilder:
                 server_version=server_version,
                 esphome_version=esphome_version,
                 dashboard_id=dashboard_identity.dashboard_id,
+                on_ha_addon=self.settings.on_ha_addon,
             )
 
         await self.remote_build_receiver.start()

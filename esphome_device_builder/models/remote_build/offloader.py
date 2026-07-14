@@ -271,3 +271,5 @@ class RemoteBuildPeer(DashboardModel):
     # (default-off mode).
     pin_sha256: str = ""
     remote_build_port: int = 0
+    # Peer advertised the ``ha_addon`` TXT key (it is the HA add-on).
+    ha_addon: bool = False
