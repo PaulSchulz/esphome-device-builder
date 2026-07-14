@@ -3,7 +3,7 @@
 This file fills in the branches the per-feature suites
 (``test_mdns_*``, ``test_probe_device``, ``test_non_api_mdns_resolve``)
 don't reach. Tests drive through the public API
-(``start`` / ``stop`` / ``probe_device`` / ``revisit_*`` / the
+(``start`` / ``stop`` / ``revisit_*`` / the
 ``apply_*`` family) plus the dispatch closure that
 ``AsyncServiceBrowser`` would invoke in production. The closure is
 captured by patching ``AsyncServiceBrowser`` so the test owns the
@@ -942,8 +942,8 @@ async def test_dispatch_added_cache_miss_resolves_and_applies(
     Drives the cache-miss path end-to-end: dispatch fires, the task
     spawns, ``async_request`` returns True, ``_apply_service_info``
     runs, and the device picks up the version. Awaiting the spawned
-    task is what exercises the real ``_resolve_then`` path (no
-    direct call to ``_resolve_then`` in the test).
+    task is what exercises the real ``resolve_then`` path (no
+    direct call to ``resolve_then`` in the test).
     """
     device = _device()
     monitor, _callbacks = _make_monitor([device])
@@ -977,7 +977,7 @@ async def test_dispatch_added_cache_miss_skips_apply_when_request_returns_false(
     """``async_request`` False (no record arrived in time) → no apply, no ONLINE claim.
 
     Pins the ``if not await info.async_request: return`` branch in
-    ``_resolve_then``: a PTR that never resolves leaves the device
+    ``resolve_then``: a PTR that never resolves leaves the device
     UNKNOWN and unclaimed by mDNS, so the ICMP sweep still owns it.
     """
     device = _device()
