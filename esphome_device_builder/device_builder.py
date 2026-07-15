@@ -713,6 +713,11 @@ class DeviceBuilder:
                 initial["peers"] = [
                     summary.to_dict() for summary in self.remote_build_receiver.peers_snapshot()
                 ]
+                initial["remote_build_settings"] = self.remote_build_receiver.settings_snapshot()
+            if self.firmware is not None:
+                # Same rows follow_jobs would replay: created_at order,
+                # ``output`` dropped (fetched per-job via follow_job).
+                initial["firmware_jobs"] = self.firmware.jobs_snapshot()
             await client.send_event(message_id, "initial_state", initial)
             # Confirm subscription so the frontend can mark the WS
             # as live before the first event arrives.
