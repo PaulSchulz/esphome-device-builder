@@ -117,15 +117,20 @@ def pairing_summary(
     )
 
 
-def identity_view(identity: DashboardIdentity, *, listener_bound: bool) -> IdentityView:
-    """Project a :class:`DashboardIdentity` into the wire shape.
+def identity_view(
+    identity: DashboardIdentity,
+    *,
+    listener_bound: bool,
+    listener_host: str | None,
+    listener_addresses: list[str],
+    listener_port: int | None,
+) -> IdentityView:
+    """
+    Project a :class:`DashboardIdentity` into the wire shape.
 
-    The listener-bound bool comes from the dashboard's
-    :meth:`DeviceBuilder.is_remote_build_listener_bound`
-    accessor; surfaced on the view so the receiver-side
-    Settings UI can branch on "this dashboard advertises
-    itself" without re-checking the bind state on every
-    paint.
+    The listener fields come from the ``DeviceBuilder``'s
+    ``is_remote_build_listener_bound`` / ``remote_build_listener_*``
+    accessors.
     """
     return IdentityView(
         dashboard_id=identity.dashboard_id,
@@ -133,4 +138,7 @@ def identity_view(identity: DashboardIdentity, *, listener_bound: bool) -> Ident
         server_version=server_version,
         esphome_version=esphome_version,
         listener_bound=listener_bound,
+        listener_host=listener_host,
+        listener_addresses=listener_addresses,
+        listener_port=listener_port,
     )

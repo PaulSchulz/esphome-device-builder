@@ -287,6 +287,23 @@ class DeviceBuilder:
         """True iff the remote-build peer-link Noise WS listener is currently bound."""
         return self._remote_build_lifecycle.is_listener_bound
 
+    @property
+    def remote_build_listener_port(self) -> int | None:
+        """The bound peer-link port, or ``None`` while the listener is down."""
+        return self._remote_build_lifecycle.listener_port
+
+    @property
+    def remote_build_listener_host(self) -> str | None:
+        """The mDNS-advertised hostname peers dial, or ``None`` without an advertiser."""
+        advertiser = self._dashboard_advertiser
+        return advertiser.hostname if advertiser is not None else None
+
+    @property
+    def remote_build_listener_addresses(self) -> list[str]:
+        """The mDNS-advertised A/AAAA addresses; ``[]`` without a registered advertiser."""
+        advertiser = self._dashboard_advertiser
+        return advertiser.addresses if advertiser is not None else []
+
     async def apply_remote_build_enabled(self) -> bool:
         """Converge the peer-link listener to the on-disk ``enabled`` flag."""
         return await self._remote_build_lifecycle.apply_enabled()

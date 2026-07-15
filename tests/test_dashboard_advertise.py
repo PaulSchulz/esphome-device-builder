@@ -537,6 +537,23 @@ async def test_service_instance_name_returns_published_name_after_register(
     assert advertiser.service_instance_name is None
 
 
+async def test_hostname_and_addresses_accessors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``hostname`` is static; ``addresses`` mirror the published ServiceInfo."""
+    monkeypatch.setattr(dashboard_advertise, "_local_addresses", lambda: ["192.168.1.10"])
+    advertiser = _make_advertiser(name="green", hostname="green.local")
+    assert advertiser.hostname == "green.local"
+    assert advertiser.addresses == []
+    zc = _make_zeroconf_mock()
+    await advertiser.register(zc)
+    try:
+        assert advertiser.addresses == ["192.168.1.10"]
+    finally:
+        await advertiser.unregister()
+    assert advertiser.addresses == []
+
+
 def test_service_target_endpoint_returns_none_before_register() -> None:
     """``service_target_endpoint`` is ``None`` until ``register()`` succeeds."""
     advertiser = _make_advertiser(name="green", hostname="green.local")
@@ -1018,6 +1035,8 @@ async def test_device_builder_advertises_in_ha_addon_mode(
             self.set_pin_sha256 = MagicMock()
             self.set_remote_build_port = MagicMock()
             self.refresh = AsyncMock()
+            self.hostname = "esphome-builder-test.local"
+            self.addresses = []
             instances.append(self)
 
     monkeypatch.setattr(db_module, "DashboardAdvertiser", _FakeAdvertiser)
@@ -1067,6 +1086,8 @@ async def test_device_builder_constructs_advertiser_when_zeroconf_present(
             self.set_pin_sha256 = MagicMock()
             self.set_remote_build_port = MagicMock()
             self.refresh = AsyncMock()
+            self.hostname = "esphome-builder-test.local"
+            self.addresses = []
             instances.append(self)
 
     monkeypatch.setattr(db_module, "DashboardAdvertiser", _FakeAdvertiser)
