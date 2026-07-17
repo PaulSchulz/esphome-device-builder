@@ -2734,6 +2734,37 @@ def test_every_board_body_generates_creatable_platform_block() -> None:
     assert not offenders, "boards generate invalid create YAML:\n" + "\n".join(offenders)
 
 
+@pytest.mark.xdist_group("catalog")
+async def test_nested_list_field_presets_render_as_yaml_lists(
+    session_component_catalog: Any,
+) -> None:
+    """Nested-list field presets survive default resolution into parseable YAML.
+
+    ``seeed-xiao-w5500-zwave-proxy`` is the first board presetting
+    list-of-mapping fields (``usb_host.devices``, ``usb_uart.channels``,
+    ``mdns.services``); pins that the generation path renders them intact.
+    """
+    board = await session_component_catalog._db.boards.get_board(
+        board_id="seeed-xiao-w5500-zwave-proxy"
+    )
+    assert board is not None
+    defaults = await session_component_catalog.resolve_default_components(board)
+    out = generate_device_yaml("zw", "Zw", board, ssid="", psk="", defaults=defaults)
+    config = yaml.safe_load(out)
+    assert config["usb_host"]["devices"] == [{"id": "device_0", "vid": "0x303A", "pid": "0x4001"}]
+    assert config["usb_uart"]["channels"] == [
+        {"id": "uch_1", "baud_rate": 115200, "buffer_size": 4096}
+    ]
+    assert config["zwave_proxy"] == {"id": "zw_proxy", "uart_id": "uch_1"}
+    assert config["mdns"]["services"] == [
+        {"service": "_zwave", "protocol": "_tcp", "port": 6053, "txt": {"protocol": "esphome"}}
+    ]
+    assert "{'" not in out
+    assert config["ethernet"]["type"] == "W5500"
+    assert config["esp32"]["flash_size"] == "16MB"
+    assert "wifi" not in config
+
+
 # ---------------------------------------------------------------------------
 # generate_device_yaml — onboard ethernet (network-provider defaults)
 # ---------------------------------------------------------------------------
