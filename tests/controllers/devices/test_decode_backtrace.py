@@ -126,7 +126,13 @@ async def test_decode_backtrace_without_crash_signal_does_not_spawn(
         ["[I][app:029]: Running through setup()", "[I][wifi:303]: WiFi connected"],
     )
 
-    assert result == {"decoded": [], "stale_build": False, "unavailable_reason": "no_backtrace"}
+    assert result == {
+        "decoded": [],
+        "stale_build": False,
+        "unavailable_reason": "no_backtrace",
+        # Refused before the build dir was ever read, so there is no build to name.
+        "local_config_hash": "",
+    }
 
 
 @pytest.mark.usefixtures("redirect_storage_path")
@@ -208,6 +214,64 @@ async def test_decode_backtrace_esp_idf_with_a_cmake_cache_decodes(
 
     assert result["unavailable_reason"] == ""
     assert result["decoded"] == _DECODED_REPLY["decoded"]
+
+
+@pytest.mark.usefixtures("redirect_storage_path")
+async def test_decode_backtrace_esp_idf_with_only_an_elf_says_elf_only(
+    tmp_path: Path,
+    make_controller: MakeControllerFactory,
+    seed_device: SeedDeviceFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The remote-build shape: the ELF landed here, the build tree never did."""
+    _yaml, build_path = await seed_device(tmp_path, "kitchen.yaml", with_build_dir=True)
+    firmware_bin = build_path / "build" / "kitchen.bin"
+    firmware_bin.parent.mkdir(parents=True, exist_ok=True)
+    firmware_bin.write_bytes(b"bin")
+    (build_path / "build" / "firmware.elf").write_bytes(b"elf")
+    write_storage_json(
+        tmp_path,
+        "kitchen.yaml",
+        build_path=build_path,
+        firmware_bin_path=firmware_bin,
+        overrides={"toolchain": "esp-idf"},
+    )
+    controller = make_controller(tmp_path)
+    _forbid_helper(monkeypatch)  # refuses before the spawn; guard that it stays that way
+
+    result = await backtrace.decode_backtrace(controller, "kitchen.yaml", _CRASH_LINES)
+
+    # Not no_build: the symbols are right there, they just cannot be resolved
+    # here. A client that can read an ELF itself is told it is worth trying.
+    assert result["unavailable_reason"] == DecodeUnavailable.ELF_ONLY
+    assert result["decoded"] == []
+
+
+@pytest.mark.usefixtures("redirect_storage_path")
+async def test_decode_backtrace_without_an_elf_is_still_no_build(
+    tmp_path: Path,
+    make_controller: MakeControllerFactory,
+    seed_device: SeedDeviceFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ELF means nothing can decode it, here or anywhere."""
+    _yaml, build_path = await seed_device(tmp_path, "kitchen.yaml", with_build_dir=True)
+    firmware_bin = build_path / "build" / "kitchen.bin"
+    firmware_bin.parent.mkdir(parents=True, exist_ok=True)
+    firmware_bin.write_bytes(b"bin")
+    write_storage_json(
+        tmp_path,
+        "kitchen.yaml",
+        build_path=build_path,
+        firmware_bin_path=firmware_bin,
+        overrides={"toolchain": "esp-idf"},
+    )
+    controller = make_controller(tmp_path)
+    _forbid_helper(monkeypatch)
+
+    result = await backtrace.decode_backtrace(controller, "kitchen.yaml", _CRASH_LINES)
+
+    assert result["unavailable_reason"] == DecodeUnavailable.NO_BUILD
 
 
 @pytest.mark.usefixtures("redirect_storage_path")
@@ -309,7 +373,9 @@ async def test_decode_backtrace_non_list_decoded_is_a_broken_contract(
 
     result = await backtrace.decode_backtrace(controller, "kitchen.yaml", _CRASH_LINES)
 
-    assert result == {"decoded": [], "stale_build": False, "unavailable_reason": "helper_failed"}
+    assert result["decoded"] == []
+    assert result["stale_build"] is False
+    assert result["unavailable_reason"] == "helper_failed"
 
 
 @pytest.mark.usefixtures("redirect_storage_path")
@@ -336,17 +402,19 @@ async def test_decode_backtrace_dropped_entries_surface_as_helper_failed(
 
     result = await backtrace.decode_backtrace(controller, "kitchen.yaml", _CRASH_LINES)
 
-    assert result == {"decoded": [], "stale_build": False, "unavailable_reason": "helper_failed"}
+    assert result["decoded"] == []
+    assert result["stale_build"] is False
+    assert result["unavailable_reason"] == "helper_failed"
 
 
 @pytest.mark.usefixtures("redirect_storage_path")
-async def test_decode_backtrace_unavailable_reply_is_never_flagged_stale(
+async def test_decode_backtrace_reports_staleness_even_when_it_decodes_nothing(
     tmp_path: Path,
     make_controller: MakeControllerFactory,
     seed_device: SeedDeviceFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``stale_build`` qualifies a decode, so it can't ride an unavailable one."""
+    """``stale_build`` describes the local build, so it survives a decline."""
     await seed_device(tmp_path, "kitchen.yaml", with_build_dir=True)
     _write_idedata(tmp_path)
     controller = make_controller(tmp_path)
@@ -358,7 +426,81 @@ async def test_decode_backtrace_unavailable_reply_is_never_flagged_stale(
 
     result = await backtrace.decode_backtrace(controller, "kitchen.yaml", _CRASH_LINES)
 
-    assert result == {"decoded": [], "stale_build": False, "unavailable_reason": "no_build"}
+    # The hashes disagree whether or not anything decoded, and a client that
+    # decodes this ELF some other way needs the caveat as much as we would.
+    assert result == {
+        "decoded": [],
+        "stale_build": True,
+        "unavailable_reason": "no_build",
+        "local_config_hash": "f3e21d5a",
+    }
+
+
+@pytest.mark.usefixtures("redirect_storage_path")
+async def test_decode_backtrace_names_the_build_on_every_answer(
+    tmp_path: Path,
+    make_controller: MakeControllerFactory,
+    seed_device: SeedDeviceFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every answer past the build dir names it, including the failures.
+
+    ``helper_failed`` sends the client to decode the ELF itself, and a client
+    caching those bytes keys on this. Answering "" there would collide two
+    builds under one key and decode the next crash against the wrong one.
+    """
+    await seed_device(tmp_path, "kitchen.yaml", with_build_dir=True)
+    _write_idedata(tmp_path)
+    controller = make_controller(tmp_path)
+    monkeypatch.setattr(backtrace, "read_build_info_hash", lambda yaml_path: "f3e21d5a")
+
+    async def _broken(*args: str, **kwargs: Any):
+        return CapturedSubprocess(returncode=1, stdout=b"", timed_out=False)
+
+    monkeypatch.setattr(backtrace, "run_subprocess_capture", _broken)
+
+    result = await backtrace.decode_backtrace(controller, "kitchen.yaml", _CRASH_LINES)
+
+    assert result["unavailable_reason"] == DecodeUnavailable.HELPER_FAILED
+    assert result["local_config_hash"] == "f3e21d5a"
+
+
+@pytest.mark.usefixtures("redirect_storage_path")
+async def test_decode_backtrace_reports_staleness_when_declining_to_decode(
+    tmp_path: Path,
+    make_controller: MakeControllerFactory,
+    seed_device: SeedDeviceFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The remote-build path: we can't decode it, but we can still caption it."""
+    _yaml, build_path = await seed_device(tmp_path, "kitchen.yaml", with_build_dir=True)
+    firmware_bin = build_path / "build" / "kitchen.bin"
+    firmware_bin.parent.mkdir(parents=True, exist_ok=True)
+    firmware_bin.write_bytes(b"bin")
+    (build_path / "build" / "firmware.elf").write_bytes(b"elf")
+    write_storage_json(
+        tmp_path,
+        "kitchen.yaml",
+        build_path=build_path,
+        firmware_bin_path=firmware_bin,
+        overrides={"toolchain": "esp-idf"},
+    )
+    controller = make_controller(tmp_path)
+    device = Device(name="kitchen", friendly_name="Kitchen", configuration="kitchen.yaml")
+    device.runtime_state.deployed_config_hash = "5a94a12d"
+    controller._scanner.get_by_configuration = lambda configuration: device
+    monkeypatch.setattr(backtrace, "read_build_info_hash", lambda yaml_path: "f3e21d5a")
+    _forbid_helper(monkeypatch)
+
+    result = await backtrace.decode_backtrace(controller, "kitchen.yaml", _CRASH_LINES)
+
+    assert result == {
+        "decoded": [],
+        "stale_build": True,
+        "unavailable_reason": DecodeUnavailable.ELF_ONLY,
+        # Names the build whoever decodes this ELF will be reading.
+        "local_config_hash": "f3e21d5a",
+    }
 
 
 @pytest.mark.usefixtures("redirect_storage_path")

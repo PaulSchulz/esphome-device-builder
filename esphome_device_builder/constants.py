@@ -150,6 +150,9 @@ class DecodeUnavailable(StrEnum):
 
     NO_BACKTRACE = "no_backtrace"
     NO_BUILD = "no_build"
+    # The ELF is here but the build tree it was compiled in is not, so nothing
+    # local can resolve addr2line.
+    ELF_ONLY = "elf_only"
     UNSUPPORTED_PLATFORM = "unsupported_platform"
     DECODE_FAILED = "decode_failed"
     HELPER_FAILED = "helper_failed"
