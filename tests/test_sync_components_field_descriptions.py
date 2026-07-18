@@ -138,3 +138,44 @@ def test_parse_bullets_skips_sub_bullets_and_blockquotes() -> None:
     fields = _parse_config_var_bullets(_ADVANCED_BODY, first_paragraph_only=True)
     assert "signing_key" not in fields  # sub-bullet, not a top-level field
     assert "must not bleed" not in fields["signed_ota_verification"]  # blockquote excluded
+
+
+# max7219digit.mdx's ``scroll_mode``: a sub-bullet whose prose wraps onto a
+# deeper-indented line after a blank, then a parent trailing paragraph.
+_WRAPPED_SUB_BULLET_BODY = """\
+- **scroll_mode** (*Optional*): Set the scroll mode. One of `CONTINUOUS` or `STOP`.
+
+  - `CONTINUOUS`  : Always scrolls and the text repeats, you might need to add some
+
+      separation at the end.
+
+  - `STOP`  : When text is over it waits and scroll is set back to the start.
+
+  This trailing note stays with scroll_mode.
+
+- **scroll_speed** (*Optional*): Set scroll speed. Defaults to `250ms`.
+"""
+
+
+def test_parse_bullets_skips_wrapped_sub_bullet_continuation() -> None:
+    """A sub-bullet's deeper-indented wrapped line doesn't leak into the parent field."""
+    fields = _parse_config_var_bullets(_WRAPPED_SUB_BULLET_BODY)
+    assert "separation at the end" not in fields["scroll_mode"]
+    # The parent trailing paragraph (back at the parent indent) is still kept.
+    assert "This trailing note stays with scroll_mode." in fields["scroll_mode"]
+    assert fields["scroll_speed"].startswith("Set scroll speed")
+
+
+# A field continuation carrying a top-level (indent-0) non-field bullet: it must
+# not establish a skip context that swallows the field's own indented prose.
+_TOP_LEVEL_BULLET_BODY = """\
+- **mode** (*Optional*): Pick a mode.
+- a plain top-level bullet that is not a config var
+  This indented prose still belongs to mode.
+"""
+
+
+def test_parse_bullets_top_level_bullet_does_not_swallow_parent_prose() -> None:
+    """An indent-0 non-field bullet doesn't skip the field's own continuation."""
+    fields = _parse_config_var_bullets(_TOP_LEVEL_BULLET_BODY)
+    assert "This indented prose still belongs to mode." in fields["mode"]
