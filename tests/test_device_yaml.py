@@ -31,6 +31,7 @@ from esphome_device_builder.helpers.device_yaml import (
     compute_has_pending_changes,
     configuration_stem,
     extract_esphome_meta_from_config,
+    generate_adoption_yaml,
     generate_device_yaml,
     generate_minimal_stub_yaml,
     load_device_from_storage,
@@ -2765,6 +2766,87 @@ async def test_nested_list_field_presets_render_as_yaml_lists(
     assert "wifi" not in config
 
 
+def _make_package_board(*, ethernet: bool) -> BoardCatalogEntry:
+    """Minimal remote-package board; *ethernet* claims the wired network via connectivity."""
+    board = _make_esp32_board()
+    board.package_import_url = (
+        "github://esphome/bluetooth-proxies/olimex/olimex-esp32-poe-iso.yaml@main"
+    )
+    board.package_name = "esphome.bluetooth-proxy"
+    if ethernet:
+        board.hardware.connectivity = [Connectivity.ETHERNET]
+    return board
+
+
+@pytest.mark.parametrize(
+    ("network", "friendly"),
+    [
+        pytest.param("wifi", "Proxy 1", id="wifi"),
+        pytest.param("ethernet", "Proxy 1", id="ethernet"),
+        pytest.param("wifi", None, id="no_friendly"),
+    ],
+)
+def test_generate_adoption_yaml_matches_dashboard_import(
+    tmp_path: Path, network: str, friendly: str | None
+) -> None:
+    """The shared adoption shape stays in lockstep with esphome's ``import_config``.
+
+    ``dashboard_import.import_config`` documents device-builder as a consumer
+    of its generated shape; both ``devices/import`` and package-board creates
+    emit through :func:`generate_adoption_yaml`, pinned here structurally
+    (API keys are random, so normalised before comparing).
+    """
+    from esphome.components.dashboard_import import import_config  # noqa: PLC0415
+
+    from script._board_import import safe_load_yaml  # noqa: PLC0415
+
+    url = "github://esphome/bluetooth-proxies/olimex/olimex-esp32-poe-iso.yaml@main"
+    ours = safe_load_yaml(
+        generate_adoption_yaml(
+            "proxy-1",
+            friendly,
+            "esphome.bluetooth-proxy",
+            url,
+            network_provided=network != "wifi",
+        )
+    )
+    reference_path = tmp_path / "proxy-1.yaml"
+    import_config(
+        str(reference_path),
+        "proxy-1",
+        friendly,
+        "esphome.bluetooth-proxy",
+        url,
+        network=network,
+        encryption=True,
+    )
+    theirs = safe_load_yaml(reference_path.read_text(encoding="utf-8"))
+    assert ours["api"]["encryption"]["key"]
+    assert theirs["api"]["encryption"]["key"]
+    ours["api"]["encryption"]["key"] = theirs["api"]["encryption"]["key"] = "<key>"
+    assert ours == theirs
+
+
+def test_generate_adoption_yaml_variants() -> None:
+    """Inline credentials quote through; missing secrets and api opt-out drop blocks."""
+    inline = generate_adoption_yaml(
+        "p", "P", "k", "github://x/y.yaml@main", ssid="Net #1", psk="pw"
+    )
+    assert 'ssid: "Net #1"' in inline
+    no_creds = generate_adoption_yaml(
+        "p", "P", "k", "github://x/y.yaml@main", wifi_secrets_available=False
+    )
+    assert "wifi" not in no_creds
+    no_api = generate_adoption_yaml("p", "P", "k", "github://x/y.yaml@main", api_encryption=False)
+    assert "api:" not in no_api
+
+
+def test_board_provides_network_for_package_boards() -> None:
+    """A package board's ethernet claim rides on ``hardware.connectivity``."""
+    assert board_provides_network(_make_package_board(ethernet=True)) is True
+    assert board_provides_network(_make_package_board(ethernet=False)) is False
+
+
 # ---------------------------------------------------------------------------
 # generate_device_yaml — onboard ethernet (network-provider defaults)
 # ---------------------------------------------------------------------------
@@ -3074,6 +3156,7 @@ def _board(
     return SimpleNamespace(
         featured_components=[SimpleNamespace(component_id=c) for c in (featured or [])],
         default_components=[SimpleNamespace(id=c) for c in (default or [])],
+        package_import_url="",
         hardware=SimpleNamespace(
             connectivity=[SimpleNamespace(value=c) for c in (connectivity or [])]
         ),
