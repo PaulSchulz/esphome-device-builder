@@ -1354,6 +1354,11 @@ def build_catalog(
     # domains are unbounded YAML lists, so every platform entry is repeatable.
     _mark_platform_domains_multi_conf(out)
 
+    # Final pass over every description (schema- and MDX-derived alike): strip
+    # leaked fenced-code examples and dangling ``One of:`` list-introducers.
+    tidied = _tidy_all_descriptions(out)
+    _LOGGER.info("Tidied %d description(s): stripped code fences / dangling introducers", tidied)
+
     return out
 
 
@@ -1987,9 +1992,7 @@ def _parse_config_var_bullets(  # noqa: C901
         if current_key is None:
             return
         joined = " ".join(p for p in current_parts if p)
-        cleaned = _clean_description_text(joined).rstrip(" .,:")
-        if cleaned and cleaned[-1] not in ".!?":
-            cleaned += "."
+        cleaned = _ensure_terminal_period(_clean_description_text(joined).rstrip(" .,:"))
         if cleaned:
             descriptions[current_key] = cleaned
 
@@ -2316,6 +2319,108 @@ def _clean_description_text(text: str) -> str:
             text = text[:1].upper() + text[1:] if text else text
             break
     return text
+
+
+def _ensure_terminal_period(text: str) -> str:
+    """Append ``.`` unless *text* already ends in sentence-terminating punctuation."""
+    if text and text[-1] not in ".!?":
+        return text + "."
+    return text
+
+
+_CODE_LANG = (
+    r"(?:yaml|yml|json|jsonc|c\+\+|cpp|c|python|py|bash|sh|shell|ini|toml|text|html|xml|cbp)"
+)
+# Optional prose that introduces a code example, shared by both fence patterns.
+# The whitespace runs are atomic (``(?>\s*)``) so a run before an unterminated
+# fence can't be re-partitioned into exponentially many ways (ReDoS guard).
+_CODE_FENCE_INTRO = r"(?>\s*)(?:for example|examples?|e\.g\.)?(?>\s*):?(?>\s*)"
+# A fenced code example: ```...``` (any body) or ``lang <body> ``. Only triple-fenced
+# or language-tagged spans match. The ``\s+`` after the language token requires a real
+# body, so inline ``code`` (double-backtick, no language) and an inline format-name
+# reference like ``json`` are both preserved.
+_CODE_FENCE_RE = re.compile(
+    _CODE_FENCE_INTRO + r"(?:`{3,}.*?`{3,}|``\s*" + _CODE_LANG + r"\s+.*?``)",
+    re.IGNORECASE | re.DOTALL,
+)
+# A trailing, unterminated fence whose body lived on excluded sub-lines.
+_CODE_FENCE_TAIL_RE = re.compile(
+    _CODE_FENCE_INTRO + r"(?:`{3,}|``\s*" + _CODE_LANG + r"\b)[^`]*$",
+    re.IGNORECASE,
+)
+# A trailing sentence that is just a list-introducer ending in ``:`` (its options
+# are sub-bullets the field extractor drops), or a bare "... one of." with no values.
+_LIST_INTRO_COLON_RE = re.compile(
+    r"(?:(?<=[.!?])\s+|^)"
+    r"(?:can be|must be|one of|any of|choose from|possible values?|valid values?|either|select from)\b"
+    r"[^.!?]{0,45}:\s*$",
+    re.IGNORECASE,
+)
+_BARE_ONE_OF_RE = re.compile(r"(?:(?<=[.!?])\s+|^)[^.!?]*\bone of\s*\.?\s*$", re.IGNORECASE)
+# Tail clean-up after a fence/introducer removal leaves stray spacing/punctuation.
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([.,;:])")
+_REPEATED_TERMINATOR_RE = re.compile(r"([.!?])(?:\s*[.!?])+")
+_MULTI_SPACE_RE = re.compile(r"\s{2,}")
+
+
+def _collapse_terminators(match: re.Match[str]) -> str:
+    """Collapse a run of sentence terminators to one, but keep a literal ``...``."""
+    run = match.group(0)
+    return run if run == "..." else match.group(1)
+
+
+def _tidy_description(text: str) -> str:
+    """
+    Strip leaked fenced-code examples and dangling list-introducers.
+
+    Returns *text* unchanged when neither is present, so a real sentence
+    that happens to end in ``:`` keeps its colon.
+    """
+    if not text:
+        return text
+    # Collapse whitespace runs first. Real descriptions are already single-spaced
+    # (``clean_docs`` / the MDX parser normalize), so this is a no-op on them; it
+    # also bounds the fence regexes to linear time on a pathological long whitespace
+    # run (a multi-line unterminated fence under ``re.DOTALL``), which the atomic
+    # groups alone leave quadratic. A clean description is still returned verbatim
+    # via the ``changed`` guard below.
+    working = _MULTI_SPACE_RE.sub(" ", text)
+    tidied = _CODE_FENCE_RE.sub("", working)
+    tidied = _CODE_FENCE_TAIL_RE.sub("", tidied)
+    changed = tidied != working
+    prev: str | None = None
+    while prev != tidied:
+        prev = tidied
+        stripped = _LIST_INTRO_COLON_RE.sub("", tidied)
+        stripped = _BARE_ONE_OF_RE.sub("", stripped)
+        if stripped != tidied:
+            changed = True
+        tidied = stripped.rstrip()
+    if not changed:
+        return text
+    tidied = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", tidied)
+    tidied = _REPEATED_TERMINATOR_RE.sub(_collapse_terminators, tidied)
+    tidied = _MULTI_SPACE_RE.sub(" ", tidied).strip().rstrip(",;:-").strip()
+    tidied = _ensure_terminal_period(tidied)
+    return tidied or text
+
+
+def _tidy_all_descriptions(node: object) -> int:
+    """Run ``_tidy_description`` over every ``description`` in the catalog tree."""
+    count = 0
+    if isinstance(node, dict):
+        desc = node.get("description")
+        if isinstance(desc, str):
+            tidied = _tidy_description(desc)
+            if tidied != desc:
+                node["description"] = tidied
+                count += 1
+        for value in node.values():
+            count += _tidy_all_descriptions(value)
+    elif isinstance(node, list):
+        for item in node:
+            count += _tidy_all_descriptions(item)
+    return count
 
 
 def load_image_map() -> dict[str, str]:
