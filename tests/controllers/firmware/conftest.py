@@ -442,6 +442,13 @@ def wire_devices(controller: FirmwareController) -> None:
     controller._db.devices = StubDevices()  # type: ignore[attr-defined]
 
 
+def seed_yamls(tmp_path: Path, *names: str) -> None:
+    """Write a minimal ESPHome YAML stub per *names* into *tmp_path*."""
+    for name in names:
+        stem = name.removesuffix(".yaml")
+        (tmp_path / name).write_text(f"esphome:\n  name: {stem}\n", encoding="utf-8")
+
+
 def attach_device(controller: FirmwareController, configuration: str, state: DeviceState) -> None:
     """Wire one mock device so ``_device_for_configuration`` resolves it; arming is assertable."""
     device = MagicMock()
