@@ -654,6 +654,27 @@ def _backfill_esp32_variants(boards: list[BoardCatalogEntry]) -> None:
             cfg.variant = Esp32Variant(variant)
 
 
+def _backfill_donor_pins(boards: list[BoardCatalogEntry]) -> None:
+    """Fill a pin-less board from the unique same-chip ``is_generic`` donor.
+
+    An absent or ambiguous donor leaves the table empty.
+    """
+
+    def _chip(cfg: BoardEsphomeConfig) -> tuple[str, str, str | None]:
+        return (cfg.platform.value, cfg.board, cfg.variant.value if cfg.variant else None)
+
+    donors: dict[tuple[str, str, str | None], list[BoardCatalogEntry]] = {}
+    for board in boards:
+        if board.is_generic and board.pins:
+            donors.setdefault(_chip(board.esphome), []).append(board)
+    for board in boards:
+        if board.pins:
+            continue
+        matched = donors.get(_chip(board.esphome), [])
+        if len(matched) == 1:
+            board.pins = list(matched[0].pins)
+
+
 def _augment_esp32_boards(boards: list[BoardCatalogEntry]) -> None:
     """
     Generate ESP32 entries for the boards manifests don't cover.
@@ -1193,6 +1214,9 @@ def build_catalog() -> BoardCatalogResponse:
     _backfill_esp32_engineering_sample(catalog.boards)
     _augment_esp8266_boards(catalog.boards)
     _augment_nrf52_boards(catalog.boards)
+    # Last pin-FILLING pass — a filler inserted after it would find its
+    # empty-pin targets already claimed; the passes below only decorate.
+    _backfill_donor_pins(catalog.boards)
     _augment_rmii_data_pins(catalog.boards)
     _stamp_featured_locked_pins(catalog.boards)
     _stamp_featured_requires(catalog.boards)
