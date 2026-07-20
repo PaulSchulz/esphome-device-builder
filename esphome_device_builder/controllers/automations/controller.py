@@ -411,13 +411,14 @@ def _component_instance(
     is_container: bool = False,
     parent_id: str | None = None,
 ) -> AvailableComponentInstance:
-    """Build one ``AvailableComponentInstance``, carrying ``name:`` only when declared."""
+    """Build one instance; ``name`` and ``has_explicit_id`` reflect only declared keys."""
     return AvailableComponentInstance(
         component_id=component_id,
         id=id_,
         name=str(section["name"]) if "name" in section else None,
         is_entity_container=is_container,
         parent_id=parent_id,
+        has_explicit_id=parsing.declares_id(section),
     )
 
 
