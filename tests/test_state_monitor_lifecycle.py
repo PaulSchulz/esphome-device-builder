@@ -1751,6 +1751,25 @@ def test_get_cached_addresses_returns_none_when_addresses_empty(
     assert monitor.mdns.get_cached_addresses("kitchen.local") is None
 
 
+def test_get_cached_addresses_drops_unspecified_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A junk 0.0.0.0 / :: announce in the zeroconf cache never reaches consumers."""
+    monitor, _callbacks = _make_monitor()
+    monitor.mdns._zeroconf = MagicMock()
+    monitor.mdns._zeroconf.zeroconf = MagicMock()
+
+    info = MagicMock()
+    info.load_from_cache.return_value = True
+    info.parsed_scoped_addresses.return_value = ["0.0.0.0", "10.0.0.1"]
+    monkeypatch.setattr(mdns_module, "AddressResolver", lambda _name: info)
+
+    assert monitor.mdns.get_cached_addresses("kitchen.local") == ["10.0.0.1"]
+
+    info.parsed_scoped_addresses.return_value = ["0.0.0.0", "::"]
+    assert monitor.mdns.get_cached_addresses("kitchen.local") is None
+
+
 async def test_start_uses_v6_fallback_when_only_v6_in_mdns_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1914,6 +1933,42 @@ def test_empty_ip_observations_are_rejected(call: Callable[[DeviceStateMonitor],
 
     with pytest.raises(ValueError, match="clear_resolved_addresses"):
         call(monitor)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda m: m.apply_ip("kitchen", "0.0.0.0"), id="apply_ip_v4"),
+        pytest.param(lambda m: m.apply_ip("kitchen", "::"), id="apply_ip_v6"),
+        pytest.param(
+            lambda m: m.apply_ip_addresses("kitchen", ["0.0.0.0", "::"]),
+            id="apply_ip_addresses_all_unspecified",
+        ),
+    ],
+)
+def test_unspecified_ip_observations_are_ignored(
+    call: Callable[[DeviceStateMonitor], bool],
+) -> None:
+    """A sinkhole resolver's 0.0.0.0 / :: never reaches device state."""
+    device = _device(ip="10.0.0.1", ip_addresses=["10.0.0.1"])
+    monitor, callbacks = _make_monitor([device])
+
+    assert call(monitor) is False
+
+    assert callbacks.calls_for("on_ip_change") == []
+    assert device.ip == "10.0.0.1"
+
+
+def test_apply_ip_addresses_drops_unspecified_keeps_real() -> None:
+    """Unspecified entries are filtered; the surviving address applies normally."""
+    device = _device(ip="", ip_addresses=[])
+    monitor, callbacks = _make_monitor([device])
+
+    assert monitor.apply_ip_addresses("kitchen", ["0.0.0.0", "10.0.0.7"]) is True
+
+    assert callbacks.calls_for("on_ip_change") == [
+        ("on_ip_change", "kitchen", "10.0.0.7", ["10.0.0.7"]),
+    ]
 
 
 def test_apply_ip_addresses_fires_when_list_changes_but_primary_does_not() -> None:
