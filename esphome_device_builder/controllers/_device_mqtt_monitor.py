@@ -14,7 +14,6 @@ disables itself; mDNS / ping discovery keeps working.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import secrets
 from collections.abc import Callable
@@ -29,6 +28,7 @@ except ImportError:  # pragma: no cover — paho-mqtt arrives via the [esphome] 
 
 from ..helpers.async_ import drain_tasks, run_in_executor
 from ..helpers.json import JSONDecodeError, loads
+from ..helpers.presence_gated_loop import PresenceGatedLoop
 from ..helpers.subscriber_presence import SubscriberPresence
 from ..models import DeviceState
 
@@ -156,7 +156,6 @@ class DeviceMqttMonitor:
         self._broker = broker
         self._on_state_change = on_state_change
         self._on_ip_change = on_ip_change
-        self._presence = presence
         self._on_connection_change = on_connection_change
         # Whether this monitor broadcasts ``esphome/discover``. The
         # coordinator designates one broadcaster per (host, port) —
@@ -167,12 +166,7 @@ class DeviceMqttMonitor:
         # so a down login never holds the broadcaster role while a
         # healthy sibling could carry it.
         self.connected = False
-        # Cuts the interval sleep short on the presence 0→1 transition
-        # so a returning dashboard doesn't wait out _PING_INTERVAL.
-        self._wake = asyncio.Event()
-        self._unsub_wake: Callable[[], None] | None = None
-        if presence is not None:
-            self._unsub_wake = presence.add_subscriber_callback(self._wake.set)
+        self._ping = _DiscoverPingLoop(self, presence)
         self._task: asyncio.Task[None] | None = None
         # device name → monotonic timestamp of the last MQTT response
         self._last_seen: dict[str, float] = {}
@@ -218,9 +212,7 @@ class DeviceMqttMonitor:
 
     async def stop(self) -> None:
         """Cancel the connect/listen task and forget all observations."""
-        if self._unsub_wake is not None:
-            self._unsub_wake()
-            self._unsub_wake = None
+        self._ping.unsubscribe()
         if self._task is None:
             return
         await drain_tasks((self._task,), log_exceptions=True)
@@ -481,41 +473,8 @@ class DeviceMqttMonitor:
                 self._on_ip_change(name, ip)
 
     async def _ping_loop(self, client: PublishClient) -> None:
-        """
-        Broadcast discover requests and sweep stale devices offline.
-
-        Every MQTT device answers each ``esphome/discover`` publish, so
-        broadcasts run only while a dashboard client is subscribed, and
-        only from the elected broadcaster. While idle the loop parks
-        with the offline aging frozen — silence without polls is not
-        evidence — and spontaneous announcements keep flowing through
-        ``_listen``. Aging belongs to the broadcaster for the same
-        reason: a silent sibling must not judge a fleet nobody is
-        polling, and a tick whose own broadcast failed to send judges
-        nobody either.
-        """
-        loop = asyncio.get_running_loop()
-        while True:
-            if self._presence is not None and not self._presence.has_subscribers():
-                await self._presence.wait_for_subscriber()
-                # Rebase so the resumed timeout window starts now —
-                # otherwise every device idle longer than the timeout
-                # mass-flips OFFLINE before it can answer the first
-                # post-resume broadcast.
-                self._rebase_last_seen()
-            broadcast_sent = self.is_publisher and await self._broadcast(client)
-            self._wake.clear()
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._wake.wait(), timeout=_PING_INTERVAL)
-            if not broadcast_sent:
-                continue
-            now = loop.time()
-            stale = [
-                name for name, last in self._last_seen.items() if now - last > _OFFLINE_TIMEOUT
-            ]
-            for name in stale:
-                self._on_state_change(name, DeviceState.OFFLINE)
-                self._last_seen.pop(name, None)
+        """Run one broker session's discover loop — see :class:`_DiscoverPingLoop`."""
+        await self._ping.run_session(client)
 
     async def _broadcast(self, client: PublishClient) -> bool:
         """
@@ -550,6 +509,15 @@ class DeviceMqttMonitor:
         for name in self._last_seen:
             self._last_seen[name] = now
 
+    def _sweep_stale(self) -> None:
+        """Flip entries silent past ``_OFFLINE_TIMEOUT`` to OFFLINE."""
+        now = asyncio.get_running_loop().time()
+        last_seen = self._last_seen
+        # Materialized so the pop below can't mutate the dict mid-iteration.
+        for name in [n for n, last in last_seen.items() if now - last > _OFFLINE_TIMEOUT]:
+            self._on_state_change(name, DeviceState.OFFLINE)
+            last_seen.pop(name, None)
+
     def _set_connected(self, *, value: bool) -> None:
         if self.connected == value:
             return
@@ -561,6 +529,63 @@ class DeviceMqttMonitor:
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
+
+
+class _DiscoverPingLoop(PresenceGatedLoop[bool]):
+    """
+    Broadcast discover requests and sweep stale devices offline.
+
+    Every MQTT device answers each ``esphome/discover`` publish, so
+    broadcasts run only while a dashboard client is subscribed, and
+    only from the elected broadcaster. While idle the loop parks
+    with the offline aging frozen — silence without polls is not
+    evidence — and spontaneous announcements keep flowing through
+    ``_listen``. Aging belongs to the broadcaster for the same
+    reason: a silent sibling must not judge a fleet nobody is
+    polling, and a tick whose own broadcast failed to send judges
+    nobody either.
+    """
+
+    _label = "MQTT discover ping"
+    # An unexpected crash must tear down the broker session so
+    # ``_run``'s reconnect taxonomy handles it; publish failures are
+    # already soft (``_broadcast`` returns False and pauses aging).
+    _continue_on_error = False
+
+    def __init__(self, monitor: DeviceMqttMonitor, presence: SubscriberPresence | None) -> None:
+        super().__init__(presence)
+        self._monitor = monitor
+        self._client: PublishClient | None = None
+
+    @property
+    def _interval(self) -> float:  # type: ignore[override]
+        # Live-read like _OFFLINE_TIMEOUT so tests patching the
+        # module constant are honored.
+        return _PING_INTERVAL
+
+    async def run_session(self, client: PublishClient) -> None:
+        """Run this loop for one broker session's *client*."""
+        self._client = client
+        try:
+            await self.run()
+        finally:
+            # Don't pin the dead session's client until the next connect.
+            self._client = None
+
+    def _on_resume(self) -> None:
+        # Rebase so the resumed timeout window starts now — otherwise
+        # every device idle longer than the timeout mass-flips OFFLINE
+        # before it can answer the first post-resume broadcast.
+        self._monitor._rebase_last_seen()
+
+    async def _work(self) -> bool:
+        assert self._client is not None  # bound in run_session
+        monitor = self._monitor
+        return monitor.is_publisher and await monitor._broadcast(self._client)
+
+    def _after_idle(self, broadcast_sent: bool) -> None:  # noqa: FBT001 — hook signature
+        if broadcast_sent:
+            self._monitor._sweep_stale()
 
 
 def _unwrap_session_error(eg: BaseExceptionGroup) -> BaseException:
