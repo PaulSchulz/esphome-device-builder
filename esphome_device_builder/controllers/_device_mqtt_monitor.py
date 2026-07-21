@@ -14,11 +14,12 @@ disables itself; mDNS / ping discovery keeps working.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 try:
     import paho.mqtt.client as paho_mqtt
@@ -28,14 +29,18 @@ except ImportError:  # pragma: no cover — paho-mqtt arrives via the [esphome] 
 
 from ..helpers.async_ import drain_tasks, run_in_executor
 from ..helpers.json import JSONDecodeError, loads
+from ..helpers.subscriber_presence import SubscriberPresence
 from ..models import DeviceState
 
 _LOGGER = logging.getLogger(__name__)
 
 _DISCOVER_TOPIC = "esphome/discover/#"
 _DISCOVER_PUBLISH_TOPIC = "esphome/discover"
-_PING_INTERVAL = 2.0  # seconds between discover requests
-_OFFLINE_TIMEOUT = 10.0  # seconds without a response before marking offline
+# ONLINE detection is push (devices announce on broker connect), so the
+# broadcast only backstops OFFLINE detection and missed announces —
+# same cadence class as the 60s ICMP sweep, not a liveness poll.
+_PING_INTERVAL = 30.0  # seconds between discover broadcasts while watched
+_OFFLINE_TIMEOUT = 65.0  # two missed broadcasts + slack before OFFLINE
 _RECONNECT_DELAY = 5.0  # delay before reconnecting after broker errors
 _CONNECT_TIMEOUT = 10.0  # seconds to wait for CONNACK before giving up
 _DEFAULT_PORT = 1883
@@ -45,6 +50,24 @@ _DEFAULT_PORT = 1883
 # :meth:`DeviceStateMonitor.apply` without an extra wrapper.
 StateCallback = Callable[[str, DeviceState], object]
 IPCallback = Callable[[str, str], object]
+
+
+class PublishInfo(Protocol):
+    """The slice of paho's ``MQTTMessageInfo`` the monitor reads."""
+
+    rc: int
+
+
+class PublishClient(Protocol):
+    """The slice of paho's ``Client`` the broadcast loop drives."""
+
+    # Mirrors paho's signature so the real client satisfies the protocol.
+    def publish(
+        self,
+        topic: str,
+        payload: bytes | None = None,
+        retain: bool = False,  # noqa: FBT001, FBT002
+    ) -> PublishInfo: ...
 
 
 @dataclass(frozen=True)
@@ -81,10 +104,29 @@ class DeviceMqttMonitor:
         broker: MqttBrokerConfig,
         on_state_change: StateCallback,
         on_ip_change: IPCallback,
+        presence: SubscriberPresence | None = None,
+        on_connection_change: Callable[[], None] | None = None,
     ) -> None:
         self._broker = broker
         self._on_state_change = on_state_change
         self._on_ip_change = on_ip_change
+        self._presence = presence
+        self._on_connection_change = on_connection_change
+        # Whether this monitor broadcasts ``esphome/discover``. The
+        # coordinator designates one broadcaster per (host, port) —
+        # extra same-broker logins subscribe but stay silent, since
+        # every broadcast makes the whole fleet answer.
+        self.is_publisher = True
+        # True between CONNACK and session teardown — election input,
+        # so a down login never holds the broadcaster role while a
+        # healthy sibling could carry it.
+        self.connected = False
+        # Cuts the interval sleep short on the presence 0→1 transition
+        # so a returning dashboard doesn't wait out _PING_INTERVAL.
+        self._wake = asyncio.Event()
+        self._unsub_wake: Callable[[], None] | None = None
+        if presence is not None:
+            self._unsub_wake = presence.add_subscriber_callback(self._wake.set)
         self._task: asyncio.Task[None] | None = None
         # device name → monotonic timestamp of the last MQTT response
         self._last_seen: dict[str, float] = {}
@@ -102,6 +144,9 @@ class DeviceMqttMonitor:
         # unexpected exception class.
         self._connect_error_logged = False
         self._unexpected_error_logged = False
+        # WARNING once per failure streak, DEBUG on repeats — re-armed
+        # by the next successful broadcast.
+        self._publish_error_logged = False
 
     @staticmethod
     def is_available() -> bool:
@@ -127,11 +172,25 @@ class DeviceMqttMonitor:
 
     async def stop(self) -> None:
         """Cancel the connect/listen task and forget all observations."""
+        if self._unsub_wake is not None:
+            self._unsub_wake()
+            self._unsub_wake = None
         if self._task is None:
             return
         await drain_tasks((self._task,), log_exceptions=True)
         self._task = None
         self._last_seen.clear()
+
+    def set_publisher(self, *, value: bool) -> None:
+        """
+        Grant or revoke the discover-broadcaster role.
+
+        Promotion rebases the last-seen ledger — entries aged during a
+        no-broadcaster gap are not evidence of death.
+        """
+        if value and not self.is_publisher:
+            self._rebase_last_seen()
+        self.is_publisher = value
 
     # ------------------------------------------------------------------
     # Internals
@@ -239,8 +298,13 @@ class DeviceMqttMonitor:
         if self._broker.username:
             client.username_pw_set(self._broker.username, self._broker.password or "")
 
-        await run_in_executor(client.connect, self._broker.host, self._broker.port)
-        client.loop_start()
+        def _connect_and_spin_up() -> None:
+            client.connect(self._broker.host, self._broker.port)
+            # loop_start's socketpair setup does a blocking accept();
+            # keep it off the loop thread too.
+            client.loop_start()
+
+        await run_in_executor(_connect_and_spin_up)
         try:
             await asyncio.wait_for(connected.wait(), timeout=_CONNECT_TIMEOUT)
             if connect_failed:
@@ -256,8 +320,8 @@ class DeviceMqttMonitor:
             # ``else`` branch on the caller's ``try`` rarely runs in
             # production.
             self._connected_this_session = True
+            self._set_connected(value=True)
             client.subscribe(_DISCOVER_TOPIC)
-            client.publish(_DISCOVER_PUBLISH_TOPIC, payload=None, retain=False)
 
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(self._listen(message_queue))
@@ -267,6 +331,7 @@ class DeviceMqttMonitor:
             # usually under a second, so no need for run_in_executor here.
             client.loop_stop()
             client.disconnect()
+            self._set_connected(value=False)
 
     async def _listen(self, queue: asyncio.Queue[Any]) -> None:
         """Push discovery responses into the state and IP callbacks."""
@@ -300,11 +365,35 @@ class DeviceMqttMonitor:
             if ip:
                 self._on_ip_change(name, ip)
 
-    async def _ping_loop(self, client: Any) -> None:
-        """Sweep stale devices offline and re-prod the broker for announcements."""
+    async def _ping_loop(self, client: PublishClient) -> None:
+        """
+        Broadcast discover requests and sweep stale devices offline.
+
+        Every MQTT device answers each ``esphome/discover`` publish, so
+        broadcasts run only while a dashboard client is subscribed, and
+        only from the elected broadcaster. While idle the loop parks
+        with the offline aging frozen — silence without polls is not
+        evidence — and spontaneous announcements keep flowing through
+        ``_listen``. Aging belongs to the broadcaster for the same
+        reason: a silent sibling must not judge a fleet nobody is
+        polling, and a tick whose own broadcast failed to send judges
+        nobody either.
+        """
         loop = asyncio.get_running_loop()
         while True:
-            await asyncio.sleep(_PING_INTERVAL)
+            if self._presence is not None and not self._presence.has_subscribers():
+                await self._presence.wait_for_subscriber()
+                # Rebase so the resumed timeout window starts now —
+                # otherwise every device idle longer than the timeout
+                # mass-flips OFFLINE before it can answer the first
+                # post-resume broadcast.
+                self._rebase_last_seen()
+            broadcast_sent = self.is_publisher and await self._broadcast(client)
+            self._wake.clear()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._wake.wait(), timeout=_PING_INTERVAL)
+            if not broadcast_sent:
+                continue
             now = loop.time()
             stale = [
                 name for name, last in self._last_seen.items() if now - last > _OFFLINE_TIMEOUT
@@ -312,7 +401,46 @@ class DeviceMqttMonitor:
             for name in stale:
                 self._on_state_change(name, DeviceState.OFFLINE)
                 self._last_seen.pop(name, None)
-            client.publish(_DISCOVER_PUBLISH_TOPIC, payload=None, retain=False)
+
+    async def _broadcast(self, client: PublishClient) -> bool:
+        """
+        Send one discover request; False pauses aging for the tick.
+
+        Publishes from the executor — paho's enqueue shares a lock
+        with its network thread mid-send, so the loop must not wait
+        on it.
+        """
+        info = await run_in_executor(client.publish, _DISCOVER_PUBLISH_TOPIC)
+        if info.rc == 0:
+            if self._publish_error_logged:
+                # The failed stretch was a no-poll period — same rebase
+                # as resuming from idle.
+                self._rebase_last_seen()
+                self._publish_error_logged = False
+            return True
+        if self._publish_error_logged:
+            _LOGGER.debug("discover broadcast still failing (rc=%s)", info.rc)
+        else:
+            _LOGGER.warning(
+                "Discover broadcast to %s:%s failed (rc=%s) — device aging paused",
+                self._broker.host,
+                self._broker.port,
+                info.rc,
+            )
+            self._publish_error_logged = True
+        return False
+
+    def _rebase_last_seen(self) -> None:
+        now = asyncio.get_running_loop().time()
+        for name in self._last_seen:
+            self._last_seen[name] = now
+
+    def _set_connected(self, *, value: bool) -> None:
+        if self.connected == value:
+            return
+        self.connected = value
+        if self._on_connection_change is not None:
+            self._on_connection_change()
 
 
 # ---------------------------------------------------------------------------
