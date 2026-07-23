@@ -9,19 +9,27 @@ refuses spaced install paths, and pioarduino has its own whitespace guard / gcc
 
 :func:`windows_short_build_paths` points the build tree at ``C:\esphb\<id8>`` for the ``with``
 block by setting ``ESPHOME_DATA_DIR`` = that root, ``PLATFORMIO_CORE_DIR`` = ``<root>\pio`` and
-``ESPHOME_ESP_IDF_PREFIX`` = ``<root>\idf`` in the process env (so ``CORE.data_dir`` and every
-compile subprocess resolve there, whichever toolchain the config selects). Per-dashboard
-roots nest under one ``C:\esphb`` parent rather than scattering ``C:\esphb-*`` across the drive
-root. Existing data is moved in once (best-effort) so warm caches survive: from the legacy flat
-``C:\esphb-<id8>`` of the first relocation release, else from ``<config>/.esphome``,
-``~/.platformio`` and esphome's machine-global IDF cache. Sweeping the IDF cache in trades
-upstream's all-projects sharing for the space-free guarantee: the multi-GB install becomes
-per-dashboard, and a cache later repopulated by CLI use is not re-merged (the completion marker
-short-circuits). Real dirs (no junction), so CMake's REALPATH can't reintroduce the spaced/long
-path. The tree is left on uninstall (a reinstall keeps the warm toolchain); delete ``C:\esphb`` by
-hand to reclaim space. No-op off Windows (including a Linux Docker container on Windows -- the
-gate is ``os.name == "nt"``), and skipped if the user already set ``ESPHOME_DATA_DIR`` (a
-deliberate path choice we don't override).
+``ESPHOME_ESP_IDF_PREFIX`` = the shared ``C:\esphb\idf`` in the process env (so ``CORE.data_dir``
+and every compile subprocess resolve there, whichever toolchain the config selects).
+Per-dashboard roots nest under one ``C:\esphb`` parent rather than scattering ``C:\esphb-*``
+across the drive root. The IDF toolchain alone is shared across dashboards, beside the roots:
+gcc probes its multilib include dirs via un-normalized ``bin/../lib/...`` self-relative paths
+that reach ~245 characters below the IDF tools dir (esphome/esphome#16896), so the prefix must
+stay within 15 characters of ``MAX_PATH`` -- ``C:\esphb\<id8>\idf`` (21) overflows, ``C:\esphb\idf``
+(12) fits, and sharing matches upstream's machine-global cache semantics (version-safe: the
+tools dir is per-version inside). Existing data is moved in once (best-effort) so warm caches
+survive: from the legacy flat ``C:\esphb-<id8>`` of the first relocation release, else from
+``<config>/.esphome`` and ``~/.platformio``; the shared IDF dir sweeps in a per-dashboard
+``<root>\idf`` from earlier releases, else esphome's machine-global IDF cache. Concurrent
+first-ever starts of two dashboards can race that one-time sweep -- accepted unserialised,
+mirroring the repo's other Windows-degraded locks (``helpers/single_instance.py``): the window
+is a same-volume rename, and the worst case discards a toolchain cache esphome re-downloads.
+A cache later repopulated by CLI use is not re-merged (the completion marker short-circuits).
+Real dirs (no junction), so CMake's REALPATH can't reintroduce the spaced/long path. The tree
+is left on uninstall (a reinstall keeps the warm toolchain); delete ``C:\esphb`` by hand to
+reclaim space. No-op off Windows (including a
+Linux Docker container on Windows -- the gate is ``os.name == "nt"``), and skipped if the user
+already set ``ESPHOME_DATA_DIR`` (a deliberate path choice we don't override).
 """
 
 from __future__ import annotations
@@ -41,6 +49,9 @@ from .dashboard_identity import get_or_create_dashboard_id
 _LOGGER = logging.getLogger(__name__)
 
 _ROOT_BASE = Path("C:\\esphb")
+# One name ties the shared toolchain dir, the per-dashboard sweep source, and the
+# reserved-suffix guard together; a rename can't silently reopen the collision.
+_IDF_DIRNAME = "idf"
 # Legacy flat base from the first relocation release (``C:\esphb-<id8>``); migrated in once.
 _LEGACY_ROOT_BASE = Path("C:\\")
 _DASHBOARD_ID_CHARS = 8
@@ -67,10 +78,10 @@ def windows_short_build_paths(config_dir: Path) -> Iterator[None]:
         yield
         return
     suffix = _safe_suffix(dashboard_id)
-    if not suffix:
-        # A hand-corrupted sidecar whose chars are all stripped would collapse the root onto the
-        # shared C:\esphb parent; refuse rather than nest every dashboard inside one another.
-        _LOGGER.warning("dashboard_id sanitized to empty; skipping build relocation")
+    if not suffix or suffix.lower() == _IDF_DIRNAME:
+        # Hand-corrupted sidecar only: empty would collapse the root onto the shared C:\esphb
+        # parent; "idf" would collide with the shared toolchain dir beside the roots.
+        _LOGGER.warning("dashboard_id sanitized to %r; skipping build relocation", suffix)
         yield
         return
     new_root = _ROOT_BASE / suffix  # C:\esphb\<id8>
@@ -86,7 +97,6 @@ def windows_short_build_paths(config_dir: Path) -> Iterator[None]:
         yield
         return
     pio = root / "pio"
-    idf = root / "idf"
 
     saved: dict[str, str | None] = {"ESPHOME_DATA_DIR": None}  # absent on entry (guarded above)
     os.environ["ESPHOME_DATA_DIR"] = str(root)
@@ -103,24 +113,15 @@ def windows_short_build_paths(config_dir: Path) -> Iterator[None]:
     # silently fall back to the long + spaced machine-global cache this exists to avoid.
     prev_idf = os.environ.get("ESPHOME_ESP_IDF_PREFIX")
     user_set_idf = bool(prev_idf and prev_idf.strip())
-    idf_cache = _default_idf_cache()
-    override_idf = not user_set_idf and _relocate_into(idf, idf_cache)
-    if override_idf:
+    idf_dir = None if user_set_idf else _resolve_idf_dir(root / _IDF_DIRNAME)
+    if idf_dir is not None:
         saved["ESPHOME_ESP_IDF_PREFIX"] = prev_idf  # may be present-but-empty; kept verbatim
-        os.environ["ESPHOME_ESP_IDF_PREFIX"] = str(idf)
-    elif not user_set_idf:
-        # Unrelocated, esphome falls back to its machine-global cache — the long + spaced path
-        # this exists to avoid — so name it before the compile fails cryptically.
-        _LOGGER.warning(
-            "ESP-IDF toolchain not relocated; native builds will use %s, where deep or spaced "
-            "paths may fail",
-            idf_cache or "esphome's default cache location",
-        )
+        os.environ["ESPHOME_ESP_IDF_PREFIX"] = str(idf_dir)
     _LOGGER.info(
         "Windows build data at %s (pio %s, idf %s)",
         root,
         pio if override_pio else "default",
-        idf if override_idf else "default",
+        idf_dir or "default",
     )
     try:
         yield
@@ -155,6 +156,35 @@ def _restore_env(saved: dict[str, str | None]) -> None:
             os.environ.pop(var, None)
         else:
             os.environ[var] = prev
+
+
+def _resolve_idf_dir(dashboard_idf: Path) -> Path | None:
+    r"""
+    Return the ESP-IDF install dir to point ``ESPHOME_ESP_IDF_PREFIX`` at, or ``None``.
+
+    Shared across dashboards: the prefix must stay within 15 chars of ``MAX_PATH`` (module
+    docstring), which a per-dashboard ``C:\esphb\<id8>\idf`` (21) cannot. Migrates
+    *dashboard_idf* (earlier releases' per-dashboard install) or the machine-global cache into
+    the shared dir; when that fails, an intact *dashboard_idf* still serves this session, and
+    with neither the default cache stands.
+    """
+    idf = _ROOT_BASE / _IDF_DIRNAME
+    idf_cache = _default_idf_cache()
+    if _relocate_into(idf, dashboard_idf, idf_cache):
+        return idf
+    if (dashboard_idf / _RELOCATED_MARKER).is_file():
+        _LOGGER.warning(
+            "Using per-dashboard ESP-IDF at %s; could not move to shared %s", dashboard_idf, idf
+        )
+        return dashboard_idf
+    # Unrelocated, esphome falls back to its machine-global cache — the long + spaced path
+    # this exists to avoid — so name it before the compile fails cryptically.
+    _LOGGER.warning(
+        "ESP-IDF toolchain not relocated; native builds will use %s, where deep or spaced "
+        "paths may fail",
+        idf_cache or "esphome's default cache location",
+    )
+    return None
 
 
 def _default_idf_cache() -> Path | None:
