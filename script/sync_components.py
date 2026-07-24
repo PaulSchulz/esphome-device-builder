@@ -298,7 +298,8 @@ _USE_ID_NAMESPACE_OVERRIDES: dict[str, str] = {
 _SECRET_KEY_FRAGMENTS = ("password", "passcode", "secret", "token", "api_key", "apikey")
 
 # Schema-time keys we don't expose to the user (build-system / preload).
-_SKIP_KEYS: frozenset[str] = frozenset({"mqtt_id", "zigbee_id", "then"})
+# ``*_id`` entries are auto-``GenerateID``'d internal references.
+_SKIP_KEYS: frozenset[str] = frozenset({"mqtt_id", "zigbee_id", "web_server_base_id", "then"})
 
 # Per-component fields we don't surface in the catalog because they're
 # deprecated and the dashboard handles the underlying concern itself.
@@ -328,41 +329,6 @@ _DEPRECATED_FIELDS: frozenset[tuple[str, str]] = frozenset(
 _BOARD_COMBOBOX_PLATFORMS: frozenset[str] = frozenset(
     {"esp8266", "nrf52", "bk72xx", "rtl87xx", "ln882x"}
 )
-
-# Cross-cutting fields that only make sense when a specific component
-# is configured on the same device — qos / retain need an ``mqtt:``
-# block, ``zigbee_sensor`` needs a ``zigbee:`` hub, and the
-# web_server entity overrides need a ``web_server:`` block. The
-# schema lists them on every entity (because they're valid options)
-# but most users never configure mqtt/zigbee/web_server, so without
-# gating the form is full of fields that quietly do nothing. The
-# frontend reads ``depends_on_component`` and hides each entry
-# unless the named component appears in the device's YAML.
-#
-# Keep this list focused on cross-cutting infrastructure. Component-
-# specific gates (e.g. "this LED option requires this LED platform")
-# belong in the per-component schema via ``depends_on`` /
-# ``depends_on_value_any`` instead.
-_COMPONENT_GATED_KEYS: dict[str, str] = {
-    # MQTT entity options (apply to every entity when ``mqtt:`` is set)
-    "qos": "mqtt",
-    "retain": "mqtt",
-    "discovery": "mqtt",
-    "subscribe_qos": "mqtt",
-    "state_topic": "mqtt",
-    "command_topic": "mqtt",
-    "availability": "mqtt",
-    # Zigbee entity options
-    "zigbee_sensor": "zigbee",
-    "zigbee_binary_sensor": "zigbee",
-    "zigbee_switch": "zigbee",
-    "zigbee_number": "zigbee",
-    # Web server entity overrides
-    "web_server": "web_server",
-    "web_server_id": "web_server",
-    "web_server_base_id": "web_server",
-}
-
 
 # UART ``DEBUG_SCHEMA`` shape — shared between ``uart.debug`` (the
 # original) and ``ble_nus.debug`` (which imports ``maybe_empty_debug``
@@ -2621,6 +2587,7 @@ def build_component_entry(
         field_ranges = {k: v for k, v in field_ranges.items() if k not in bleed}
     _apply_field_ranges(config_entries, field_ranges)
     _apply_refined_types(config_entries, introspection.get("refined_types") or {})
+    _apply_component_gates(config_entries, introspection.get("component_gates") or {})
     _apply_typed_defaults(config_entries, introspection.get("typed_defaults") or {})
     _apply_inclusive_groups(config_entries, introspection.get("inclusive_groups") or {})
     _apply_list_fields(config_entries, introspection.get("list_fields") or {})
@@ -2887,12 +2854,6 @@ def _convert_config_vars(
         override = _FIELD_OVERRIDES.get((component_id, key))
         if override is not None:
             entry = {**entry, **copy.deepcopy(override)}
-        # Cross-cutting infrastructure fields are only meaningful when
-        # the named component is configured. Tag them so the frontend
-        # can hide them by default.
-        gate = _COMPONENT_GATED_KEYS.get(key)
-        if gate and not entry.get("depends_on_component"):
-            entry["depends_on_component"] = gate
         out.append(entry)
     return _sort_entries(out)
 
@@ -4716,6 +4677,7 @@ def introspect_component(component_id: str) -> dict[str, Any]:
         return merged
 
     refined_types = merge_from_platforms(_collect_refined_types)
+    component_gates = merge_from_platforms(_collect_component_gates)
     platform_constraints = merge_from_platforms(_collect_platform_constraints)
     field_ranges = _drop_machine_derived_ranges(
         component_id, merge_from_platforms(_collect_field_ranges)
@@ -4760,6 +4722,7 @@ def introspect_component(component_id: str) -> dict[str, Any]:
         "field_ranges": field_ranges,
         "field_range_bleed_keys": field_range_bleed_keys,
         "refined_types": refined_types,
+        "component_gates": component_gates,
         "inclusive_groups": inclusive_groups,
         "required_groups": required_groups,
         "list_fields": list_fields,
@@ -5776,6 +5739,97 @@ def _collect_refined_types(  # noqa: C901
     return out
 
 
+@cache
+def _target_platform_names() -> frozenset[str]:
+    """Chip platform ids from esphome's ``Platform`` enum; empty if unimportable."""
+    try:
+        from esphome.const import Platform
+    except Exception:
+        return frozenset()
+    return frozenset(p.value for p in Platform)
+
+
+def _requires_component_gate(validator: Any) -> str | None:
+    """
+    Component name from a ``cv.requires_component`` validator chain, else None.
+
+    Peels ``vol.All`` wrappers; the first gate in chain order wins.
+    """
+    qualname = getattr(validator, "__qualname__", "") or ""
+    if qualname.startswith("requires_component.") and (
+        getattr(validator, "__module__", "") == "esphome.config_validation"
+    ):
+        try:
+            comp = _closure_nonlocals(validator).get("comp")
+        except ValueError:
+            comp = None
+        if isinstance(comp, str) and comp:
+            return comp
+    for inner in getattr(validator, "validators", None) or ():
+        gate = _requires_component_gate(inner)
+        if gate is not None:
+            return gate
+    return None
+
+
+def _only_with_gate(key: Any) -> str | None:
+    """
+    Component gating a ``cv.OnlyWith`` key marker, else None.
+
+    A list value requires every named component; the gate is the first
+    non-chip name (chip gating belongs to ``supported_platforms``).
+    """
+    if type(key).__name__ != "OnlyWith":
+        return None
+    if getattr(type(key), "__module__", "") != "esphome.config_validation":
+        return None
+    component = getattr(key, "_component", None)
+    names = component if isinstance(component, list) else [component]
+    chips = _target_platform_names()
+    for name in names:
+        if isinstance(name, str) and name and name not in chips:
+            return name
+    return None
+
+
+def _collect_component_gates(manifest: Any) -> dict[tuple[str, ...], str]:
+    """
+    Walk the live ``CONFIG_SCHEMA`` for cross-component gates.
+
+    Recovers what the schema bundle drops: ``cv.requires_component``
+    validator wrappers and ``cv.OnlyWith`` key markers. A container whose
+    every child carries one identical gate inherits it (the bare key has
+    nothing to introspect).
+    """
+    schema = getattr(manifest, "config_schema", None)
+    if schema is None:
+        return {}
+    out: dict[tuple[str, ...], str] = {}
+    visited: list[tuple[str, ...]] = []
+
+    def visit(key: Any, _key_name: str, val: Any, path: tuple[str, ...]) -> None:
+        visited.append(path)
+        gate = _only_with_gate(key) or _requires_component_gate(val)
+        if gate is not None:
+            out[path] = gate
+
+    _walk_schema_keys(schema, visit, descend_list_items=True)
+
+    visited_set = set(visited)
+    by_parent: dict[tuple[str, ...], list[tuple[str, ...]]] = {}
+    for path in visited:
+        if len(path) > 1:
+            by_parent.setdefault(path[:-1], []).append(path)
+    # Deepest parents first so an inherited gate can cascade upward.
+    for parent, kids in sorted(by_parent.items(), key=lambda kv: -len(kv[0])):
+        if parent in out or parent not in visited_set:
+            continue
+        gates = {out.get(kid) for kid in kids}
+        if len(gates) == 1 and (gate := next(iter(gates))) is not None:
+            out[parent] = gate
+    return out
+
+
 def _int_enum_refined_type(validator: Any) -> RefinedType | None:
     """Return an ``integer`` refinement iff *validator*'s live enum values are all real ints."""
     values = _extract_enum_values(validator)
@@ -6272,6 +6326,27 @@ def _normalize_bus_constraint_value(key: str, value: Any) -> Any:
     if key.endswith("timeout"):
         return cv.time_period(value).total_milliseconds
     return value
+
+
+def _apply_component_gates(
+    entries: list[dict],
+    gates: dict[tuple[str, ...], str],
+) -> None:
+    """
+    Stamp introspected cross-component gates onto matching entries.
+
+    Explicit ``depends_on_component`` values (overrides, ``default_with``)
+    win; the introspected gate only fills the gap.
+    """
+    if not gates:
+        return
+
+    def visit(entry: dict, path: tuple[str, ...]) -> None:
+        gate = gates.get(path)
+        if gate and not entry.get("depends_on_component"):
+            entry["depends_on_component"] = gate
+
+    _walk_catalog_entries(entries, visit)
 
 
 def _apply_refined_types(
