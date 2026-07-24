@@ -1868,6 +1868,31 @@ def _iter_component_mdx() -> Iterator[tuple[str, str, Path]]:
             yield f"{parts[0]}.{parts[1]}", parts[1], mdx_path
 
 
+def _index_by_id_and_stem[V](triples: Iterable[tuple[str, str, V]]) -> dict[str, V]:
+    """
+    Index by catalog id and bare stem; drop a stem whose pages disagree.
+
+    A bare stem shared by two pages with different values is dropped rather
+    than resolved by ``rglob`` walk order (non-deterministic). Exact
+    catalog-id keys are always authoritative.
+    """
+    by_cid: dict[str, V] = {}
+    stem_value: dict[str, V] = {}
+    ambiguous: set[str] = set()
+    for cid, stem, value in triples:
+        by_cid[cid] = value
+        if stem in stem_value:
+            if stem_value[stem] != value:
+                ambiguous.add(stem)
+        else:
+            stem_value[stem] = value
+    out: dict[str, V] = dict(by_cid)
+    for stem, value in stem_value.items():
+        if stem not in ambiguous:
+            out.setdefault(stem, value)
+    return out
+
+
 def _load_mdx_descriptions() -> dict[str, str]:
     """Walk the cached docs repo, return ``{component_id: description}``.
 
@@ -1882,16 +1907,11 @@ def _load_mdx_descriptions() -> dict[str, str]:
     Caches the cloned docs repo in ``.cache/esphome.io/`` so re-runs
     don't refetch.
     """
-    out: dict[str, str] = {}
-    for component_id, stem, mdx_path in _iter_component_mdx():
-        text = _extract_mdx_description(mdx_path.read_text(encoding="utf-8"))
-        if text:
-            out[component_id] = text
-            # Also index under the bare stem if it's not already taken,
-            # so e.g. ``ota.esphome`` falls back to ``esphome.mdx`` if
-            # ever needed (rare, but cheap to support).
-            out.setdefault(stem, text)
-    return out
+    return _index_by_id_and_stem(
+        (component_id, stem, text)
+        for component_id, stem, mdx_path in _iter_component_mdx()
+        if (text := _extract_mdx_description(mdx_path.read_text(encoding="utf-8")))
+    )
 
 
 def _components_with_own_docs_page() -> frozenset[str]:
@@ -1917,13 +1937,11 @@ def _load_mdx_titles() -> dict[str, str]:
     "ESPHome OTA Updates"). Indexed by both the catalog id
     (``ota.esphome``) and the bare stem (``esphome``).
     """
-    out: dict[str, str] = {}
-    for component_id, stem, mdx_path in _iter_component_mdx():
-        title = _extract_mdx_title(mdx_path.read_text(encoding="utf-8"))
-        if title:
-            out[component_id] = title
-            out.setdefault(stem, title)
-    return out
+    return _index_by_id_and_stem(
+        (component_id, stem, title)
+        for component_id, stem, mdx_path in _iter_component_mdx()
+        if (title := _extract_mdx_title(mdx_path.read_text(encoding="utf-8")))
+    )
 
 
 # Frontmatter title matcher — same shape as the description matcher.
@@ -1953,13 +1971,11 @@ def _load_mdx_field_descriptions() -> dict[str, dict[str, str]]:
     Used to fill in per-field descriptions for components whose schema
     entries lack a ``docs`` field — most visibly the OTA platforms.
     """
-    out: dict[str, dict[str, str]] = {}
-    for component_id, stem, mdx_path in _iter_component_mdx():
-        fields = _extract_mdx_field_descriptions(mdx_path.read_text(encoding="utf-8"))
-        if fields:
-            out[component_id] = fields
-            out.setdefault(stem, fields)
-    return out
+    return _index_by_id_and_stem(
+        (component_id, stem, fields)
+        for component_id, stem, mdx_path in _iter_component_mdx()
+        if (fields := _extract_mdx_field_descriptions(mdx_path.read_text(encoding="utf-8")))
+    )
 
 
 # Top-level config-variable bullet line:
@@ -2130,13 +2146,11 @@ def _load_mdx_field_sections() -> dict[str, list[dict]]:
     Same id / stem keying as :func:`_load_mdx_field_descriptions`; feeds the
     nested field-description matcher.
     """
-    out: dict[str, list[dict]] = {}
-    for component_id, stem, mdx_path in _iter_component_mdx():
-        sections = _enumerate_mdx_field_sections(mdx_path.read_text(encoding="utf-8"))
-        if sections:
-            out[component_id] = sections
-            out.setdefault(stem, sections)
-    return out
+    return _index_by_id_and_stem(
+        (component_id, stem, sections)
+        for component_id, stem, mdx_path in _iter_component_mdx()
+        if (sections := _enumerate_mdx_field_sections(mdx_path.read_text(encoding="utf-8")))
+    )
 
 
 def _match_section_to_node(
