@@ -9,6 +9,7 @@ import pytest
 from script.sync_components import (  # type: ignore[import-not-found]
     _apply_component_gates,
     _collect_component_gates,
+    introspect_component,
 )
 
 
@@ -131,3 +132,20 @@ def test_apply_never_overrides_an_explicit_gate() -> None:
     entries = [{"key": "command_retain", "depends_on_component": "custom"}]
     _apply_component_gates(entries, {("command_retain",): "mqtt"})
     assert entries[0]["depends_on_component"] == "custom"
+
+
+def test_live_switch_platform_derives_the_mqtt_gates(cv) -> None:
+    """The installed esphome's real gpio manifests yield the entity gates."""
+    gates = introspect_component("gpio").get("component_gates") or {}
+    assert gates.get(("command_retain",)) == "mqtt"
+    assert gates.get(("state_topic",)) == "mqtt"
+    assert gates.get(("web_server",)) == "web_server"
+    assert gates.get(("web_server", "web_server_id")) == "web_server"
+    assert gates.get(("zigbee_switch",)) == "zigbee"
+
+
+def test_live_mqtt_component_has_no_self_gate(cv) -> None:
+    """The mqtt component's own fields carry no gate on mqtt itself."""
+    info = introspect_component("mqtt")
+    assert info, "mqtt manifest did not introspect"
+    assert ("discovery",) not in (info.get("component_gates") or {})
