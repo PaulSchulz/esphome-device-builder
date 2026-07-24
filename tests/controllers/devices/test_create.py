@@ -356,6 +356,128 @@ async def test_create_device_slugifies_hostname_and_preserves_raw_name_as_friend
 
 
 @pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_create_device_uses_explicit_friendly_name_with_name_as_hostname(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """Pins that with ``friendly_name``, ``name`` is the hostname and both land verbatim."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+    boards = StubBoardLookups(ctrl)
+    boards.find_by_pio_board_returns(None)
+    boards.find_by_platform_variant_returns(None)
+
+    result = await ctrl.create_device(name="bad-lueftung", friendly_name="Lüftung EG Bad")
+
+    assert result.configuration == "bad-lueftung.yaml"
+    content = (tmp_path / "bad-lueftung.yaml").read_text("utf-8")
+    assert "esphome:\n  name: bad-lueftung\n  friendly_name: Lüftung EG Bad\n" in content
+    storage = StorageJSON.load(tmp_path / "storage.json")
+    assert storage is not None
+    assert storage.name == "bad-lueftung"
+    assert storage.friendly_name == "Lüftung EG Bad"
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_create_device_rejects_invalid_overridden_hostname(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """Pins that a non-slug hostname override is rejected, never silently rewritten."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+
+    with pytest.raises(CommandError) as excinfo:
+        await ctrl.create_device(name="My Plug", friendly_name="Bedroom Plug")
+
+    assert excinfo.value.code == ErrorCode.INVALID_ARGS
+    assert "not a valid hostname" in excinfo.value.message
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+@pytest.mark.parametrize(
+    "hostname",
+    [
+        pytest.param("-plug", id="leading-hyphen"),
+        pytest.param("plug-", id="trailing-hyphen"),
+        pytest.param("-", id="bare-hyphen"),
+        pytest.param("a" * 32, id="over-length-cap"),
+    ],
+)
+async def test_create_device_rejects_invalid_hostname_override_shapes(
+    tmp_path: Path, make_controller: MakeControllerFactory, hostname: str
+) -> None:
+    """Pins that edge-hyphen and over-cap overrides are refused, never rewritten."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+
+    with pytest.raises(CommandError) as excinfo:
+        await ctrl.create_device(name=hostname, friendly_name="Bedroom Plug")
+
+    assert excinfo.value.code == ErrorCode.INVALID_ARGS
+    assert "not a valid hostname" in excinfo.value.message
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_create_device_accepts_hostname_override_at_the_length_cap(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """Pins that a 31-char override is accepted verbatim (the derive path clamps instead)."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+    boards = StubBoardLookups(ctrl)
+    boards.find_by_pio_board_returns(None)
+    boards.find_by_platform_variant_returns(None)
+
+    name = "a" * 31
+    result = await ctrl.create_device(name=name, friendly_name="Bedroom Plug")
+
+    assert result.configuration == f"{name}.yaml"
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_create_device_rejects_blank_hostname_with_friendly_name(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """Pins that a blank explicit hostname says name-is-required, not a charset complaint."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+
+    with pytest.raises(CommandError) as excinfo:
+        await ctrl.create_device(name="   ", friendly_name="Bedroom Plug")
+
+    assert excinfo.value.code == ErrorCode.INVALID_ARGS
+    assert excinfo.value.message == "name is required"
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_create_device_keeps_underscore_hostname_override_verbatim(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """Pins that a legal-but-unusual override (underscores) lands exactly as previewed."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+    boards = StubBoardLookups(ctrl)
+    boards.find_by_pio_board_returns(None)
+    boards.find_by_platform_variant_returns(None)
+
+    result = await ctrl.create_device(name="my_plug", friendly_name="Bedroom Plug")
+
+    assert result.configuration == "my_plug.yaml"
+    content = (tmp_path / "my_plug.yaml").read_text("utf-8")
+    assert "esphome:\n  name: my_plug\n  friendly_name: Bedroom Plug\n" in content
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_create_device_blank_friendly_name_falls_back_to_derive(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """Pins that a whitespace-only ``friendly_name`` uses the name-only derive path."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+    boards = StubBoardLookups(ctrl)
+    boards.find_by_pio_board_returns(None)
+    boards.find_by_platform_variant_returns(None)
+
+    result = await ctrl.create_device(name="Guest Room Fan", friendly_name="   ")
+
+    assert result.configuration == "guest-room-fan.yaml"
+    content = (tmp_path / "guest-room-fan.yaml").read_text("utf-8")
+    assert "esphome:\n  name: guest-room-fan\n  friendly_name: Guest Room Fan\n" in content
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
 async def test_create_device_quotes_friendly_name_with_yaml_metachars(
     tmp_path: Path, make_controller: MakeControllerFactory
 ) -> None:
@@ -391,6 +513,21 @@ async def test_create_device_rejects_name_with_no_hostname_safe_characters(
     assert excinfo.value.code == ErrorCode.INVALID_ARGS
     assert "hostname-safe" in excinfo.value.message
     assert ctrl._scanner.calls == []
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_create_device_invalid_hostname_error_names_the_hostname_input(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """Pins that the invalid-hostname error cites the hostname, not the friendly name."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+
+    with pytest.raises(CommandError) as excinfo:
+        await ctrl.create_device(name="🚀", friendly_name="Bedroom")
+
+    assert excinfo.value.code == ErrorCode.INVALID_ARGS
+    assert "'🚀'" in excinfo.value.message
+    assert "Bedroom" not in excinfo.value.message
 
 
 @pytest.mark.usefixtures("stub_create_device_metadata_helpers")
