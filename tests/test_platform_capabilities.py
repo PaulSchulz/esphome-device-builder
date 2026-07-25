@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import orjson
+from esphome.components.esp32.boards import BOARDS as ESP32_BOARDS
 from esphome.components.esp32.const import VARIANTS
 from esphome.components.libretiny.const import FAMILY_COMPONENT
 from esphome.components.rp2040.boards import BOARDS
@@ -26,10 +27,11 @@ from esphome_device_builder.definitions import (
     _parse_download_types,
     load_platform_capabilities_index,
 )
+from script.sync_components import _logger_interface_snapshot  # type: ignore[import-not-found]
 
 from .conftest import catalog_releases_ahead as _catalog_releases_ahead
 
-_EMPTY = PlatformCapabilities([], [], [], [], {}, [])
+_EMPTY = PlatformCapabilities([], [], [], [], {}, [], {}, {}, [])
 
 
 def test_loader_returns_known_platforms() -> None:
@@ -73,6 +75,7 @@ def test_index_within_installed_esphome() -> None:
         (set(caps.esp32_no_wifi_variants), set(NO_WIFI_VARIANTS)),
         (set(caps.libretiny_families), set(FAMILY_COMPONENT.values())),
         (set(caps.rp2040_no_wifi_boards), installed_no_wifi_boards),
+        (set(caps.esp32_board_variants), set(ESP32_BOARDS)),
     ]
     for component in ("esp32", "esp8266", "rp2040"):
         module = importlib.import_module(f"esphome.components.{component}")
@@ -90,6 +93,24 @@ def test_index_within_installed_esphome() -> None:
         else:
             extra = indexed - installed
             assert not extra, f"committed index data no installed esphome exposes: {extra}"
+
+
+def test_logger_interface_snapshot_within_installed_esphome() -> None:
+    """Checked-in logger snapshot stays within one esphome release of the live schema."""
+    live_defaults, live_values = _logger_interface_snapshot()
+    caps = load_platform_capabilities_index()
+    ahead = _catalog_releases_ahead()
+    pairs = [
+        (set(caps.logger_interface_defaults.items()), set(live_defaults.items())),
+        (set(caps.logger_interface_values), set(live_values)),
+    ]
+    for indexed, installed in pairs:
+        if ahead >= 1:
+            missing = installed - indexed
+            assert not missing, f"installed logger data missing from the newer catalog: {missing}"
+        else:
+            extra = indexed - installed
+            assert not extra, f"committed logger data no installed esphome exposes: {extra}"
 
 
 def test_load_missing_index_is_empty(tmp_path: Path) -> None:
@@ -120,6 +141,24 @@ def test_load_coerces_non_list_fields(tmp_path: Path) -> None:
     caps = _load_platform_capabilities(path)
     assert caps.esp32_variants == []
     assert caps.libretiny_families == ["bk72xx"]  # the non-str 7 is filtered
+
+
+def test_load_coerces_string_maps(tmp_path: Path) -> None:
+    """The str→str map fields keep valid pairs; anything else drops."""
+    path = tmp_path / "x.json"
+    path.write_bytes(
+        orjson.dumps(
+            {
+                "esp32_board_variants": {"esp32dev": "ESP32", "bad": 7},
+                "logger_interface_defaults": {"esp32c3": "USB_SERIAL_JTAG", "bad": 7},
+            }
+        )
+    )
+    caps = _load_platform_capabilities(path)
+    assert caps.esp32_board_variants == {"esp32dev": "ESP32"}
+    assert caps.logger_interface_defaults == {"esp32c3": "USB_SERIAL_JTAG"}
+    path.write_bytes(orjson.dumps({"esp32_board_variants": "notadict"}))
+    assert _load_platform_capabilities(path).esp32_board_variants == {}
 
 
 def test_parse_download_types_drops_malformed() -> None:

@@ -43,7 +43,9 @@ from esphome_device_builder.helpers.device_yaml._parsing import (
     _is_valid_esphome_name,
     device_ap_label,
     extract_logger_baud_rate,
+    extract_logger_interface,
     extract_ota_partition_access,
+    resolve_esp32_variant,
 )
 from esphome_device_builder.models import (
     BoardCatalogEntry,
@@ -859,6 +861,105 @@ def test_extract_logger_baud_rate_zero_disabled() -> None:
 def test_extract_logger_baud_rate_none(config: Any) -> None:
     """Missing / malformed / unresolvable / negative baud yields ``None``."""
     assert extract_logger_baud_rate(config) is None
+
+
+@pytest.mark.parametrize(
+    ("config", "platform", "expected"),
+    [
+        ({"logger": {"hardware_uart": "UART2"}}, "esp8266", "UART2"),
+        ({"logger": {"hardware_uart": "usb_serial_jtag"}}, "esp32", "USB_SERIAL_JTAG"),
+        ({"logger": None}, "esp8266", "UART0"),  # bare block, platform default
+        ({"logger": {}}, "rp2040", "USB_CDC"),
+        ({"logger": {}}, "nrf52", "USB_CDC"),
+        ({"logger": {}, "esp32": {"variant": "esp32c3"}}, "esp32", "USB_SERIAL_JTAG"),
+        ({"logger": {}, "esp32": {"variant": "ESP32-S2"}}, "esp32", "USB_CDC"),
+        ({"logger": {}, "esp32": {"variant": "ESP32"}}, "esp32", "UART0"),
+    ],
+)
+def test_extract_logger_interface_resolves(config: dict, platform: str, expected: str) -> None:
+    """Explicit ``hardware_uart`` wins; else the platform / variant default."""
+    assert extract_logger_interface(config, platform) == expected
+
+
+def test_extract_logger_interface_resolves_substitution() -> None:
+    assert (
+        extract_logger_interface({"logger": {"hardware_uart": "$uart"}}, "esp32", {"uart": "uart1"})
+        == "UART1"
+    )
+
+
+def test_extract_logger_interface_storage_variant_fills_missing_yaml_variant() -> None:
+    config = {"logger": {}, "esp32": {"board": "unknown-board"}}
+    assert extract_logger_interface(config, "esp32", None, "ESP32C3") == "USB_SERIAL_JTAG"
+
+
+def test_resolve_esp32_variant_family_storage_defers_to_board_snapshot() -> None:
+    """A never-compiled sidecar seeds the bare family; the board must answer."""
+    config = {"esp32": {"board": "esp32-s3-devkitc-1"}}
+    assert resolve_esp32_variant(config, None, "esp32") == "esp32s3"
+    # Bare family with an unknown board stays unknowable, never UART0's key.
+    assert resolve_esp32_variant({"esp32": {"board": "custom"}}, None, "esp32") is None
+
+
+def test_resolve_esp32_variant_resolves_substitutions() -> None:
+    subs = {"chip": "esp32c6", "the_board": "esp32-s3-devkitc-1"}
+    assert resolve_esp32_variant({"esp32": {"variant": "$chip"}}, subs) == "esp32c6"
+    assert resolve_esp32_variant({"esp32": {"board": "${the_board}"}}, subs) == "esp32s3"
+
+
+def test_resolve_esp32_variant_unresolved_yaml_variant_falls_back_to_storage() -> None:
+    config = {"esp32": {"variant": "${chip}"}}
+    assert resolve_esp32_variant(config, None, "ESP32C3") == "esp32c3"
+
+
+def test_extract_logger_interface_board_snapshot_fallback() -> None:
+    config = {"logger": {}, "esp32": {"board": "esp32-s3-devkitc-1"}}
+    assert extract_logger_interface(config, "esp32") == "USB_SERIAL_JTAG"
+
+
+@pytest.mark.parametrize(
+    ("config", "platform"),
+    [
+        (None, "esp32"),
+        ({}, "esp32"),  # no logger block at all
+        ({"logger": {"hardware_uart": "DEFAULT"}}, "bk72xx"),  # runtime-resolved
+        ({"logger": {"hardware_uart": "${unset}"}}, "esp32"),  # unresolved token
+        ({"logger": {"hardware_uart": True}}, "esp32"),  # non-string
+        ({"logger": {}}, "bk72xx"),  # libretiny default is unknowable
+        ({"logger": {}}, ""),  # unknown platform
+        ({"logger": {}}, "esp32"),  # esp32 with no variant or board
+        ({"logger": {}, "esp32": {"board": "no-such-board"}}, "esp32"),
+    ],
+)
+def test_extract_logger_interface_none(config: Any, platform: str) -> None:
+    """Unknowable interfaces (no logger, libretiny, unknown variant) yield ``None``."""
+    assert extract_logger_interface(config, platform) is None
+
+
+def test_load_device_from_storage_resolves_logger_interface(tmp_path: Path) -> None:
+    yaml_file = tmp_path / "c3.yaml"
+    yaml_file.write_text(
+        "esphome:\n  name: c3\nesp32:\n  variant: esp32c3\nlogger:\n",
+        encoding="utf-8",
+    )
+    assert load_device_from_storage(yaml_file).logger_interface == "USB_SERIAL_JTAG"
+
+    silent = tmp_path / "nolog.yaml"
+    silent.write_text("esphome:\n  name: nolog\nesp32:\n  variant: esp32c3\n", encoding="utf-8")
+    assert load_device_from_storage(silent).logger_interface is None
+
+
+@pytest.mark.usefixtures("_redirect_ext_storage")
+def test_load_device_from_storage_family_sidecar_uses_board_snapshot(tmp_path: Path) -> None:
+    """A never-compiled sidecar's bare-family platform doesn't shadow the board."""
+    yaml_file = tmp_path / "s3.yaml"
+    yaml_file.write_text(
+        "esphome:\n  name: s3\nesp32:\n  board: esp32-s3-devkitc-1\nlogger:\n",
+        encoding="utf-8",
+    )
+    # Fixture default sidecar carries the bare-family esp_platform ("esp32").
+    write_storage_json(tmp_path, "s3.yaml")
+    assert load_device_from_storage(yaml_file).logger_interface == "USB_SERIAL_JTAG"
 
 
 @pytest.mark.parametrize(
