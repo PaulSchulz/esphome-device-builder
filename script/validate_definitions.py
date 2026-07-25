@@ -63,24 +63,39 @@ _FEATURED_CATEGORY_EXCEPTIONS = {"ethernet"}
 _WIFI_RADIO_COMPONENT_IDS = {"esp32_hosted"}
 
 
-def _load_esp32_no_wifi_variants() -> frozenset[str]:
+def _load_capabilities_snapshot() -> dict:
     """
-    Read ``esp32_no_wifi_variants`` from the capabilities snapshot.
+    Parse the capabilities snapshot; empty mapping when unreadable.
 
     Stdlib json rather than ``load_platform_capabilities_index`` — the
     pre-commit hook env has no ``orjson``, so the runtime loader isn't
-    importable here. An unreadable snapshot degrades to an empty set
+    importable here. An unreadable snapshot degrades to empty vocabularies
     (fail-open), matching the runtime loader's behaviour.
     """
     caps_path = DEFINITIONS_DIR / "platform_capabilities.index.json"
     try:
         caps = json.loads(caps_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        return {}
+    return caps if isinstance(caps, dict) else {}
+
+
+def _snapshot_variant_set(caps: dict, key: str) -> frozenset[str]:
+    """Return the normalized variant set for *key*; empty (and loud) when malformed."""
+    values = caps.get(key)
+    if not isinstance(values, list):
+        print(
+            f"warning: {key} missing or malformed in platform_capabilities.index.json; "
+            "the check backed by it is disabled",
+            file=sys.stderr,
+        )
         return frozenset()
-    return frozenset(str(v).lower() for v in caps.get("esp32_no_wifi_variants", []))
+    return frozenset(normalize_chip_variant(str(v)) for v in values)
 
 
-_ESP32_NO_WIFI_VARIANTS = _load_esp32_no_wifi_variants()
+_CAPS_SNAPSHOT = _load_capabilities_snapshot()
+_ESP32_NO_WIFI_VARIANTS = _snapshot_variant_set(_CAPS_SNAPSHOT, "esp32_no_wifi_variants")
+_ESP32_VARIANTS = _snapshot_variant_set(_CAPS_SNAPSHOT, "esp32_variants")
 
 # Required shape for featured-component ids: lowercase letters, digits, and
 # underscores only, starting with a letter. Mirrors what ESPHome accepts
@@ -216,6 +231,8 @@ def validate_board(
                 seen_gpios.add(gpio)
                 pins_by_gpio[gpio] = pin
 
+    errors.extend(_validate_variant_vocabulary(board_id, data))
+
     # Imported boards (source.type set) carry only synthesized pin
     # entries with empty ``features`` — we don't have a per-chip pin-
     # feature DB to populate them. Skip the per-pin feature
@@ -235,6 +252,36 @@ def validate_board(
     errors.extend(_validate_image_paths(board_id, data))
 
     return errors
+
+
+def _validate_variant_vocabulary(board_id: str, data: dict) -> list[str]:
+    """Reject a non-canonical or out-of-vocabulary variant; fail open on an empty snapshot."""
+    esphome_cfg = data.get("esphome")
+    declared = esphome_cfg.get("variant") if isinstance(esphome_cfg, dict) else None
+    if not isinstance(declared, str):
+        return []
+    canonical = normalize_chip_variant(declared)
+    # Family membership first, decided on the folded value — a mixed-case
+    # non-esp32 typo gets the real diagnosis in one round, not after a
+    # lowercasing round-trip.
+    if not canonical.startswith("esp32"):
+        return [
+            f"{board_id}: esphome.variant '{declared}' must be an esp32-family variant "
+            "(e.g. esp32c3)"
+        ]
+    # Vocabulary before spelling: the spelling message proposes the folded
+    # value, so it must only fire when that value is actually accepted.
+    if _ESP32_VARIANTS and canonical not in _ESP32_VARIANTS:
+        return [
+            f"{board_id}: esphome.variant '{declared}' is not a known esp32 variant "
+            "(vocabulary: esp32_variants in platform_capabilities.index.json)"
+        ]
+    if declared != canonical:
+        return [
+            f"{board_id}: esphome.variant '{declared}' must be the canonical lowercase "
+            f"spelling '{canonical}'"
+        ]
+    return []
 
 
 def _validate_pins_from(
@@ -500,8 +547,10 @@ def _validate_featured(  # noqa: C901
 
 def _validate_wifi_radio_claim(board_id: str, data: dict) -> list[str]:
     """Require a radio-provider default when a no-native-Wi-Fi variant claims wifi."""
-    esphome_cfg = data.get("esphome") or {}
-    variant = str(esphome_cfg.get("variant") or "").lower()
+    esphome_cfg = data.get("esphome")
+    if not isinstance(esphome_cfg, dict):
+        return []
+    variant = normalize_chip_variant(str(esphome_cfg.get("variant") or ""))
     if esphome_cfg.get("platform") != "esp32" or variant not in _ESP32_NO_WIFI_VARIANTS:
         return []
     connectivity = (data.get("hardware") or {}).get("connectivity") or []
