@@ -284,7 +284,7 @@ def test_decode_bundle_rejects_oversize_before_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An over-long base64 payload is rejected by encoded length, pre-decode."""
-    monkeypatch.setattr(mutations_import_bundle, "_MAX_BUNDLE_UPLOAD_BYTES", 16)
+    monkeypatch.setattr(mutations_import_bundle, "BUNDLE_MAX_TOTAL_BYTES", 16)
 
     with pytest.raises(CommandError) as excinfo:
         mutations_import_bundle._decode_bundle("A" * 200)
@@ -391,7 +391,7 @@ def test_decode_bundle_rejects_oversize_after_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A payload that clears the encoded pre-check but decodes over the cap is rejected."""
-    monkeypatch.setattr(mutations_import_bundle, "_MAX_BUNDLE_UPLOAD_BYTES", 16)
+    monkeypatch.setattr(mutations_import_bundle, "BUNDLE_MAX_TOTAL_BYTES", 16)
     # 24 base64 chars equal the encoded-length ceiling but decode to 18 bytes.
     with pytest.raises(CommandError) as excinfo:
         mutations_import_bundle._decode_bundle("A" * 24)
