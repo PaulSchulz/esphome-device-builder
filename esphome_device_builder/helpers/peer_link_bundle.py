@@ -4,7 +4,7 @@ Bundle chunking + reassembly helpers for the peer-link ``submit_job`` flow.
 The offloader produces a gzipped tarball via
 :class:`esphome.bundle.ConfigBundleCreator`; that's a single
 ``bytes`` payload that has to ride the peer-link's per-frame
-size cap (:data:`APP_FRAME_MAX_BYTES`, 32 KiB).
+size cap (:data:`APP_FRAME_MAX_BYTES`, 60 KiB).
 :func:`chunk_bundle` slices the bundle into the wire-format's
 base64 envelope shape; :class:`BundleAssembler` does the
 reverse on the receiver side, with structured rejection of
@@ -57,13 +57,17 @@ from typing import NoReturn
 # in half on a typical ESPHome bundle.
 BUNDLE_CHUNK_SIZE_BYTES = 32 * 1024
 
-# Hard cap on the assembled bundle. ESPHome bundles in the
-# wild are 5-50 KiB compressed; an exotic image-heavy include
-# tree can push to a few hundred KiB. 4 MiB is well above the
-# realistic ceiling but small enough that a misbehaving
-# offloader can't pin gigabytes of memory pretending to send
-# a bundle. May be revisited based on production bundle sizes.
-BUNDLE_MAX_TOTAL_BYTES = 4 * 1024 * 1024
+# Hard cap on the assembled bundle. Most ESPHome bundles are a
+# few KiB compressed, but image/font-heavy include trees (many
+# ``mdi:`` icons resized into embedded ``BINARY`` images) have
+# been observed near ~40 MiB in the wild. 128 MiB leaves generous
+# headroom while still bounding receiver RAM: peak is ~2x the cap
+# per in-flight session (``finalise`` copies the assembled
+# bytearray), and ``_inflight`` is keyed per paired offloader, so
+# concurrent submits multiply it. The receiver enforces this cap,
+# so an offloader only benefits once the build server is on a
+# version that carries the larger value.
+BUNDLE_MAX_TOTAL_BYTES = 128 * 1024 * 1024
 
 # Hard cap on the assembled firmware tarball. The materialise
 # pipeline ships the receiver's full build subtree (firmware

@@ -156,6 +156,11 @@ def test_assembler_rejects_non_positive_num_chunks() -> None:
     assert excinfo.value.code is BundleAssemblerErrorCode.CHUNK_COUNT_MISMATCH
 
 
+def test_assembler_accepts_realistic_image_heavy_announcement() -> None:
+    """A ~40 MiB header (the image-heavy real-world size) constructs, not rejected."""
+    BundleAssembler(total_bytes=40 * 1024 * 1024, num_chunks=1, sha256_hex="0" * 64)
+
+
 def test_assembler_rejects_oversized_announcement() -> None:
     """A header announcing more than :data:`BUNDLE_MAX_TOTAL_BYTES` is rejected."""
     with pytest.raises(BundleAssemblerError) as excinfo:
