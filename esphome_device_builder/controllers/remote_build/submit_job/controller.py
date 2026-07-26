@@ -37,6 +37,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
+from ....helpers.async_ import run_in_executor
+from ....helpers.paths import PathEscapeError
 from ....helpers.peer_link_bundle import (
     BundleAssembler,
     BundleAssemblerError,
@@ -44,6 +46,7 @@ from ....helpers.peer_link_bundle import (
     decode_chunk,
 )
 from ....helpers.peer_link_frames import frame_schema, is_valid_frame, safe_job_id
+from ....helpers.remote_build_layout import RemoteBuildPath
 from ....helpers.version_compat import coerce_pep440_version
 from ....models import (
     PAIRING_VERSION_MAX_LEN,
@@ -137,9 +140,9 @@ _RECOVERABLE_ASSEMBLER_ERRORS: frozenset[BundleAssemblerErrorCode] = frozenset(
 # ``configuration_filename``. Path separators (both flavours so
 # the rule holds across receiver platforms) and the NUL byte.
 # The rule's job is to catch obviously-malicious shapes early;
-# the resolve-and-stay-under-root check at extract time is the
-# defence-in-depth gate that catches anything an exotic filename
-# would slip past this.
+# the header-time resolve-and-stay-under-root check (re-run at
+# extract) catches anything an exotic filename would slip past
+# this.
 _FORBIDDEN_FILENAME_CHARS: frozenset[str] = frozenset({"/", "\\", "\x00"})
 
 
@@ -282,8 +285,8 @@ class SubmitJobReceiver:
         * Header field shapes the wire-format TypedDict can't
           enforce at runtime (target outside the
           ``compile`` / ``clean`` set, malformed
-          ``configuration_filename``), plus the explicit
-          ``upload_unsupported`` reject.
+          ``configuration_filename``, a path-escaping extract
+          dir), plus the explicit ``upload_unsupported`` reject.
         * Assembler-construction validation (oversized total,
           empty bundle, etc.) — a ``submit_job_ack`` rejection,
           not a ``terminate``: the chunk stream hasn't started,
@@ -308,6 +311,17 @@ class SubmitJobReceiver:
             )
             return
         job_id = frame["job_id"]
+        # Validate the peer-supplied filename and the derived extract dir —
+        # the stem becomes the second path segment under
+        # ``.esphome/.remote_builds/<dashboard_id>/<device_name>/``, so a
+        # separator / ``..`` / escaping resolve would let a malicious
+        # offloader write outside the intended subtree. Runs before the
+        # duplicate gate: its executor hop is the only await here, keeping
+        # the check-then-register region below atomic on the loop.
+        device_stem = await self._resolve_device_stem(session, frame)
+        if device_stem is None:
+            await self._reject(session, job_id=job_id, reason=REASON_INVALID_HEADER)
+            return
         # A resubmit of a job_id whose accepted bundle is still mid-extract
         # would overwrite the extract index and mis-route a cancel.
         if session.dashboard_id in self._inflight or self._extracts.is_tracked(
@@ -322,16 +336,6 @@ class SubmitJobReceiver:
             await self._reject(session, job_id=job_id, reason=REASON_UPLOAD_UNSUPPORTED)
             return
         if target not in TARGET_TO_JOB_TYPE:
-            await self._reject(session, job_id=job_id, reason=REASON_INVALID_HEADER)
-            return
-        # Validate the peer-supplied filename — it becomes the
-        # second path segment under
-        # ``.esphome/.remote_builds/<dashboard_id>/<device_name>/``.
-        # An unvalidated separator / ``..`` here would let a
-        # malicious offloader write the assembled tarball
-        # outside the intended subtree.
-        device_stem = _validate_configuration_filename(frame["configuration_filename"])
-        if device_stem is None:
             await self._reject(session, job_id=job_id, reason=REASON_INVALID_HEADER)
             return
         try:
@@ -443,6 +447,31 @@ class SubmitJobReceiver:
                 self, session=session, pending=pending, bundle_bytes=assembled
             ),
         )
+
+    async def _resolve_device_stem(
+        self, session: PeerLinkSession, frame: SubmitJobFrameData
+    ) -> str | None:
+        """
+        Return the validated YAML stem for *frame*, or ``None`` to reject.
+
+        Runs the filename gate plus the under-root resolve on the derived
+        extract dir.
+        """
+        device_stem = _validate_configuration_filename(frame["configuration_filename"])
+        if device_stem is None:
+            return None
+        key = RemoteBuildPath(dashboard_id=session.dashboard_id, device_name=device_stem)
+        try:
+            # ``Path.resolve`` walks the filesystem; keep it off the loop.
+            await run_in_executor(key.resolved_subtree, self._config_dir)
+        except PathEscapeError:
+            _LOGGER.warning(
+                "submit_job from %s: target dir for %r escapes the remote-builds root; rejecting",
+                session.dashboard_id,
+                frame["configuration_filename"],
+            )
+            return None
+        return device_stem
 
     async def _reject_assembler(
         self,
