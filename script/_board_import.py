@@ -407,9 +407,11 @@ def emit_manifest(record: dict[str, Any], *, boards_dir: Path) -> Path | None:
     emitted manifest and the ownership check can't disagree. Skips with a
     warning when the target already holds a manifest this source doesn't
     own — a hand-curated board (no ``source.type``) or another import
-    source's output. Images are referenced as upstream URLs in the
-    manifest itself; any pre-existing local ``images/`` subdir from older
-    syncs is removed so the wheel doesn't carry stale mirrors.
+    source's output. Prior ``locked`` flags on featured-component
+    fields carry across re-imports; values still come from upstream.
+    Images are referenced as upstream URLs in the manifest itself; any
+    pre-existing local ``images/`` subdir from older syncs is removed so
+    the wheel doesn't carry stale mirrors.
     """
     source_type = record["source"]["type"]
     target_dir = boards_dir / record["id"]
@@ -426,6 +428,8 @@ def emit_manifest(record: dict[str, Any], *, boards_dir: Path) -> Path | None:
         )
         return None
     target_dir.mkdir(parents=True, exist_ok=True)
+
+    record = _carry_curated_locks(prior, record)
 
     # Carry a hand-curated ``full_config`` opt-out/opt-in across re-imports —
     # the importer never sets it (imports derive ``full_config`` from
@@ -476,3 +480,89 @@ def load_components_index() -> dict[str, dict[str, Any]]:
             f"{_COMPONENTS_INDEX_JSON} not found — run script/sync_components.py first."
         )
     return load_component_catalog(_COMPONENTS_INDEX_JSON, _COMPONENTS_BODIES_DIR)
+
+
+def _carry_curated_locks(prior: dict[str, Any] | None, record: dict[str, Any]) -> dict[str, Any]:
+    """
+    Re-lock fields the prior manifest locked, keyed by entry ``id`` + field name.
+
+    Values come from the fresh record; the record is rebuilt, never mutated.
+    A prior lock with no matching entry or field is dropped with a warning.
+    """
+    prior_featured = prior.get("featured_components") if prior is not None else None
+    new_featured = record.get("featured_components")
+    if not isinstance(prior_featured, list) or not isinstance(new_featured, list):
+        return record
+
+    prior_locks = _collect_locked_fields(prior_featured)
+    if not prior_locks:
+        return record
+    _warn_unmatched_locks(record["id"], prior_locks, new_featured)
+    rebuilt = [
+        _relock_entry(
+            entry, prior_locks.get(entry.get("id", "")) if isinstance(entry, dict) else None
+        )
+        for entry in new_featured
+    ]
+    return {**record, "featured_components": rebuilt}
+
+
+def _collect_locked_fields(featured: list[Any]) -> dict[str, set[str]]:
+    """Map each featured entry's ``id`` to its ``locked: true`` field names."""
+    out: dict[str, set[str]] = {}
+    for entry in featured:
+        if not isinstance(entry, dict) or not isinstance(entry.get("fields"), dict):
+            continue
+        locked = {
+            fkey
+            for fkey, fval in entry["fields"].items()
+            if isinstance(fval, dict) and fval.get("locked") is True
+        }
+        if locked and isinstance(entry.get("id"), str):
+            out[entry["id"]] = locked
+    return out
+
+
+def _warn_unmatched_locks(
+    board_id: str, prior_locks: dict[str, set[str]], new_featured: list[Any]
+) -> None:
+    """Warn for every prior locked field the re-import can't re-apply."""
+    fields_by_id = {
+        entry["id"]: entry.get("fields")
+        for entry in new_featured
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    }
+    for entry_id, fkeys in sorted(prior_locks.items()):
+        fields = fields_by_id.get(entry_id)
+        present = fields.keys() if isinstance(fields, dict) else ()
+        for fkey in sorted(fkeys - set(present)):
+            _LOGGER.warning(
+                "%s: locked preset %s.%s from the prior manifest has no match in the "
+                "re-import; lock dropped",
+                board_id,
+                entry_id,
+                fkey,
+            )
+
+
+def _relock_entry(entry: Any, locked_keys: set[str] | None) -> Any:
+    """Return *entry* with every field in *locked_keys* locked."""
+    fields = entry.get("fields") if isinstance(entry, dict) else None
+    if not locked_keys or not isinstance(fields, dict):
+        return entry
+    return {
+        **entry,
+        "fields": {
+            fkey: _lock_preset(fval) if fkey in locked_keys else fval
+            for fkey, fval in fields.items()
+        },
+    }
+
+
+def _lock_preset(fval: Any) -> Any:
+    """Return the ``locked: true`` form of a field preset."""
+    if isinstance(fval, dict):
+        if fval.get("locked") is True:
+            return fval
+        return {**fval, "locked": True}
+    return {"value": fval, "locked": True}
