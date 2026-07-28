@@ -283,13 +283,25 @@ class DeviceStateMonitor(TaskControllerBase):
         if old is not None:
             self._emit_source_change(name, old, ReachabilitySource.UNKNOWN)
 
-    def confirmed_offline(self, name: str, source: str) -> None:
-        """Tear down every per-name ledger after *source* confirms *name* is gone."""
-        self.apply(name, DeviceState.OFFLINE, source)
+    def source_withdrawn(self, name: str, source: str) -> None:
+        """
+        Release every per-name claim after *source* withdrew.
+
+        An already-OFFLINE bucket keeps its state; the ledger is never
+        stamped, so the withdrawal emits a single source change. With
+        no ICMP arbiter the withdrawal demotes to OFFLINE instead of
+        parking on UNKNOWN.
+        """
+        # UNKNOWN only under a confirmed arbiter: a pre-probe (None)
+        # withdrawal on a host whose probe then fails would park
+        # UNKNOWN with no sweep ever running. Demoting instead always
+        # self-corrects — the sweep pings OFFLINE devices every pass.
+        state = DeviceState.UNKNOWN if self.ping.icmp_available is True else DeviceState.OFFLINE
+        already_offline = not self._any_matching_device_differs(name, "state", DeviceState.OFFLINE)
+        if not already_offline and self._any_matching_device_differs(name, "state", state):
+            self._on_state_change(name, state, source)
         self.clear_resolved_addresses(name)
         self.forget(name)
-        if self.state.reachability is not None:
-            self.state.reachability.clear(name)
 
     def _emit_source_change(self, name: str, old: str, new: str) -> None:
         """Notify the owner when *name*'s authoritative source actually flips."""
@@ -535,10 +547,10 @@ class DeviceStateMonitor(TaskControllerBase):
         Report whether mDNS owns *name* while the bucket has an api device.
 
         The one condition under which ``deployed_identity_live`` must
-        stay down: the announce lifecycle (verify-before-demote
-        ``Removed``) vouches for an api device's identity while mDNS
-        owns it, so a powered-off device blanks instead of a stale
-        flag resurfacing its identity. Deliberately false for non-api
+        stay down: the announce lifecycle (``Removed`` withdraws the
+        claim) vouches for an api device's identity while mDNS owns
+        it, so a powered-off device blanks instead of a stale flag
+        resurfacing its identity. Deliberately false for non-api
         buckets — their mdns ownership is a bare A-record resolve,
         reachability only, and suppressing their stamps would strand a
         post-flash stamp on firmware with no identity TXT to re-stamp

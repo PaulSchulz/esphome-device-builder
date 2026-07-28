@@ -9,9 +9,9 @@ These tests pin the four hand-offs the monitor makes to the tracker:
 2. ``apply(name, OFFLINE, source)`` does *not* record — an OFFLINE
    transition isn't a freshness signal, the channel stopped hearing
    from the device.
-3. mDNS browser ``Removed`` clears every signal for the device — the
-   intent is "we lost the device", a re-announce should start with
-   fresh timestamps not stale-by-hours ones.
+3. mDNS browser ``Removed`` withdraws the mDNS claim but leaves the
+   other channels' freshness stamps alone — a withdrawal says nothing
+   about what ping / MQTT last heard.
 4. The ping path captures ``Host.min_rtt`` and pairs it with the
    apply call — the "Round trip 4 ms" line in the drawer comes from
    here.
@@ -44,7 +44,6 @@ from esphome_device_builder.controllers._device_state_monitor import (
     DeviceStateMonitor,
     _decode_txt_bytes_to_sorted_pairs,
 )
-from esphome_device_builder.controllers._device_state_monitor import helpers as helpers_module
 from esphome_device_builder.controllers._device_state_monitor._state import MonitorState
 from esphome_device_builder.controllers._device_state_monitor.importable import ImportableDiscovery
 from esphome_device_builder.controllers._device_state_monitor.mdns import MdnsSource
@@ -107,6 +106,7 @@ def _make_monitor(
     monitor.state.reachability = tracker
     monitor._on_state_change = _flip_state(devices)
     monitor._on_ip_change = lambda _n, _i, _l: None
+    monitor._on_resolved_addresses_cleared = None
     monitor._on_source_change = None
     monitor._on_version_change = None
     monitor._on_config_hash_change = None
@@ -530,38 +530,26 @@ def test_forget_drops_source_ledger() -> None:
     assert "kitchen" not in monitor.state.state_source
 
 
-async def test_mdns_removed_via_dispatch_clears_tracker() -> None:
-    """The real browser-callback path (Removed) routes through to ``clear``.
-
-    Sanity-check the integration end-to-end: drive a captured
-    dispatch closure with ``ServiceStateChange.Removed`` and
-    confirm the tracker's per-device entry is gone afterwards.
-    Without this we'd be relying on the test above which calls
-    ``clear`` directly — that misses any future refactor that
-    routes the Removed branch through a path the tracker isn't
-    wired into.
-    """
+async def test_mdns_removed_via_dispatch_keeps_channel_freshness() -> None:
+    """The real browser-callback Removed path leaves ping / MQTT stamps alone."""
     devices = [_make_device(state=DeviceState.ONLINE)]
     tracker = ReachabilityTracker()
-    tracker.observe("kitchen", "mdns")
+    tracker.observe("kitchen", "ping")
+    tracker.observe("kitchen", "mqtt")
 
     monitor = _make_monitor(devices, tracker)
+    monitor.ping.icmp_available = True
 
-    # Replay the Removed branch the same way the dispatch closure
-    # would. The branch lives inline inside ``_start_mdns_browser``;
-    # exercising it without standing up zeroconf means inlining the
-    # six lines here is honest about what we're testing.
-    state_change = ServiceStateChange.Removed
-    name = "kitchen._esphomelib._tcp.local."
-    device_name = helpers_module.device_name_from_service(name)
-    if state_change == ServiceStateChange.Removed:
-        monitor.apply(device_name, DeviceState.OFFLINE, "mdns")
-        monitor.state.state_source.pop(device_name, None)
-        if monitor.state.reachability is not None:
-            monitor.state.reachability.clear(device_name)
+    monitor.mdns._on_esphomelib_service_state_change(
+        MagicMock(),
+        "_esphomelib._tcp.local.",
+        "kitchen._esphomelib._tcp.local.",
+        ServiceStateChange.Removed,
+    )
 
-    snap = tracker.snapshot("kitchen", state=DeviceState.OFFLINE, active_source="unknown", ip="")
-    assert snap["mdns_last_seen_seconds_ago"] is None
+    snap = tracker.snapshot("kitchen", state=DeviceState.UNKNOWN, active_source="unknown", ip="")
+    assert snap["ping_last_seen_seconds_ago"] is not None
+    assert snap["mqtt_last_seen_seconds_ago"] is not None
 
 
 def test_get_mdns_cache_info_no_zeroconf_returns_none() -> None:

@@ -107,6 +107,10 @@ class MdnsSource:
         # otherwise stack concurrent resolvers, each holding a global
         # zeroconf listener for the whole resolve window.
         self._inflight_resolves: set[str] = set()
+        # Per-service withdrawal counter. A resolve that started before
+        # the latest ``Removed`` may complete off records that predate
+        # the goodbye; its apply must not re-claim mdns ownership.
+        self._withdrawal_epochs: dict[str, int] = {}
 
     @property
     def zeroconf(self) -> AsyncEsphomeZeroconf | None:
@@ -442,10 +446,12 @@ class MdnsSource:
         At most one resolve per service name is in flight. Returns
         True when the service resolved and *apply* ran, False on a
         confirmed miss, None when there is no verdict (a swallowed
-        error, or a resolve already in flight).
+        error, a resolve already in flight, or a withdrawal that
+        raced this resolve).
         """
         if info.name in self._inflight_resolves:
             return None
+        epoch = self._withdrawal_epochs.get(info.name, 0)
         self._inflight_resolves.add(info.name)
         try:
             if not await info.async_request(zeroconf, timeout=timeout_ms):
@@ -455,6 +461,10 @@ class MdnsSource:
             return None
         finally:
             self._inflight_resolves.discard(info.name)
+        if self._withdrawal_epochs.get(info.name, 0) != epoch:
+            # A withdrawal raced the resolve; the answer may predate the
+            # goodbye, so leave the verdict to the woken ping sweep.
+            return None
         apply(device_name, info)
         return True
 
@@ -468,7 +478,16 @@ class MdnsSource:
         """Apply *info* synchronously off the zeroconf cache, else resolve fire-and-forget."""
         applier = apply or self._apply_service_info
         if info.load_from_cache(zeroconf):
-            applier(device_name, info)
+            # The cache may vouch only behind a live PTR. A goodbye
+            # withdraws just the PTR, so SRV/A linger for a sleeping
+            # device (#2369) — and resolving instead is no escape,
+            # ``async_request`` would short-circuit on the same cached
+            # records. With the PTR gone the claim stays with ping /
+            # the announce lifecycle. Gates every applier routed here
+            # (http identity, importable) — a withdrawn service's
+            # leftover TXT shouldn't re-stamp anything either.
+            if self._cached_ptr(info.name, info.type) is not None:
+                applier(device_name, info)
             return
         self._monitor._track_task(self.resolve_then(zeroconf, info, device_name, applier))
 
@@ -487,7 +506,7 @@ class MdnsSource:
             return
 
         if state_change == ServiceStateChange.Removed:
-            monitor._track_task(self._verify_removed(zeroconf, name, device_name))
+            self._on_service_removed(name, device_name)
             return
 
         # Don't claim ONLINE off a bare PTR — only once the service
@@ -514,23 +533,16 @@ class MdnsSource:
             self._on_http_service_state_change(zeroconf, service_type, name, state_change)
             importable.on_http_service_state_change(zeroconf, service_type, name, state_change)
 
-    async def _verify_removed(self, zeroconf: Any, name: str, device_name: str) -> None:
-        """Resolve before honouring a ``Removed``; only a confirmed miss applies OFFLINE."""
-        if name in self._inflight_resolves:
-            # A concurrent resolve decides; the sweep re-checks either way.
-            return
-        info = AsyncServiceInfo(_ESPHOME_SERVICE_TYPE, name)
-        verdict = await self.resolve_then(zeroconf, info, device_name, self._apply_service_info)
-        if verdict is None:
-            # Errored, not missed — never demote on uncertainty, and say
-            # so above DEBUG since this gates the browser's OFFLINE path.
-            _LOGGER.warning(
-                "Removed-verify resolve for %s errored; leaving state to the sweep", device_name
-            )
-            return
-        if verdict:
-            return
-        self._monitor.confirmed_offline(device_name, "mdns")
+    def _on_service_removed(self, name: str, device_name: str) -> None:
+        """Withdraw the mDNS claim and wake the ping sweep to decide."""
+        # A goodbye withdraws only the PTR (firmware never byes SRV/A,
+        # which stay cached for their full TTLs), so a verify-resolve
+        # here would vouch for a sleeping device straight off the cache
+        # and latch it ONLINE (#2369, #1776).
+        self._withdrawal_epochs[name] = self._withdrawal_epochs.get(name, 0) + 1
+        monitor = self._monitor
+        monitor.source_withdrawn(device_name, "mdns")
+        monitor.probe_device_ping(device_name)
 
     def _apply_service_info(self, device_name: str, info: AsyncServiceInfo) -> None:
         """
@@ -545,7 +557,8 @@ class MdnsSource:
         # Claimed before the apply-path unspecified-address filter, unlike
         # the active-resolve path: a resolved service is liveness evidence
         # on its own (already claimed even when addressless), and the
-        # browser's ``Removed`` lifecycle demotes — no permanent latch.
+        # browser's ``Removed`` lifecycle withdraws the claim so ping
+        # decides — no permanent latch.
         monitor.apply(device_name, DeviceState.ONLINE, "mdns", claim=True)
         # Pass the full announced address set (IPv4 first, then
         # scoped IPv6 — link-local entries keep the ``%scope``
