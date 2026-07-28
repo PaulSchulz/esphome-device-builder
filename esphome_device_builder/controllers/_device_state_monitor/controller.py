@@ -279,8 +279,7 @@ class DeviceStateMonitor(TaskControllerBase):
 
     def forget(self, name: str) -> None:
         """Drop the source-precedence ledger entry for *name*."""
-        old = self.state.state_source.pop(name, None)
-        if old is not None:
+        if (old := self._pop_source(name)) is not None:
             self._emit_source_change(name, old, ReachabilitySource.UNKNOWN)
 
     def source_withdrawn(self, name: str, source: str) -> None:
@@ -290,7 +289,9 @@ class DeviceStateMonitor(TaskControllerBase):
         An already-OFFLINE bucket keeps its state; the ledger is never
         stamped, so the withdrawal emits a single source change. With
         no ICMP arbiter the withdrawal demotes to OFFLINE instead of
-        parking on UNKNOWN.
+        parking on UNKNOWN. An api bucket with known identity gets
+        ``deployed_identity_live`` stamped back — the announce
+        lifecycle stops vouching the moment ownership is released.
         """
         # UNKNOWN only under a confirmed arbiter: a pre-probe (None)
         # withdrawal on a host whose probe then fails would park
@@ -301,7 +302,16 @@ class DeviceStateMonitor(TaskControllerBase):
         if not already_offline and self._any_matching_device_differs(name, "state", state):
             self._on_state_change(name, state, source)
         self.clear_resolved_addresses(name)
-        self.forget(name)
+        # The identity hand-back stamps between the ledger pop and its
+        # notification: the stamp is refused while mDNS owns the name,
+        # and stamping before the source change keeps every frame
+        # holding the frontend gate through one disjunct or the other
+        # (the clear-side ordering rule in ``_emit_source_change``).
+        old = self._pop_source(name)
+        if self._has_known_api_identity(name):
+            self.apply_deployed_identity_live(name, live=True)
+        if old is not None:
+            self._emit_source_change(name, old, ReachabilitySource.UNKNOWN)
 
     def _emit_source_change(self, name: str, old: str, new: str) -> None:
         """Notify the owner when *name*'s authoritative source actually flips."""
@@ -542,15 +552,32 @@ class DeviceStateMonitor(TaskControllerBase):
             name, "deployed_identity_live", live, forward, name, live=live
         )
 
+    def _pop_source(self, name: str) -> str | None:
+        """Remove and return *name*'s ledger entry without notifying."""
+        return self.state.state_source.pop(name, None)
+
+    def _has_known_api_identity(self, name: str) -> bool:
+        """
+        Whether some api device named *name* already carries identity fields.
+
+        Version / mac only — the fields a Native API ``device_info``
+        can vouch for. ``deployed_config_hash`` is mDNS-TXT-born and
+        never arrives without ``version`` beside it.
+        """
+        return any(
+            d.api_enabled and (d.runtime_state.deployed_version or d.mac_address)
+            for d in self._get_devices_by_name(name)
+        )
+
     def _mdns_owns_api_identity(self, name: str) -> bool:
         """
         Report whether mDNS owns *name* while the bucket has an api device.
 
         The one condition under which ``deployed_identity_live`` must
-        stay down: the announce lifecycle (``Removed`` withdraws the
-        claim) vouches for an api device's identity while mDNS owns
-        it, so a powered-off device blanks instead of a stale flag
-        resurfacing its identity. Deliberately false for non-api
+        stay down: the announce lifecycle vouches for an api device's
+        identity while mDNS owns it, so an in-flight stamp can't race
+        the transition-into-mdns clear; the withdrawal owns the
+        hand-back. Deliberately false for non-api
         buckets — their mdns ownership is a bare A-record resolve,
         reachability only, and suppressing their stamps would strand a
         post-flash stamp on firmware with no identity TXT to re-stamp
