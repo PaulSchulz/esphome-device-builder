@@ -2605,15 +2605,18 @@ def build_component_entry(
     _apply_platform_defaults(config_entries, introspection.get("platform_defaults") or {})
     _apply_platform_constraints(config_entries, introspection.get("platform_constraints") or {})
     field_ranges = introspection.get("field_ranges") or {}
+    refined_types = introspection.get("refined_types") or {}
     if domain:
-        # Platform build: drop hub-bounded ranges that bleed onto a
-        # platform field this domain redefines unbounded (e.g. the
-        # modbus_controller item ``address``). Hub builds keep them.
+        # Platform build: drop hub-derived signals that bleed onto a
+        # platform field this domain redefines (e.g. the modbus_controller
+        # item ``address``). Hub builds keep them.
         bleed = (introspection.get("field_range_bleed_keys") or {}).get(domain, set())
         field_ranges = {k: v for k, v in field_ranges.items() if k not in bleed}
+        refined_bleed = (introspection.get("refined_bleed_keys") or {}).get(domain, set())
+        refined_types = {k: v for k, v in refined_types.items() if k not in refined_bleed}
     # Refined types first: the range gate reads the entry's final type,
     # and a field promoted to float_with_unit must keep its bounds.
-    _apply_refined_types(config_entries, introspection.get("refined_types") or {})
+    _apply_refined_types(config_entries, refined_types)
     _apply_field_ranges(config_entries, field_ranges, component_id)
     _apply_component_gates(config_entries, introspection.get("component_gates") or {})
     _apply_typed_defaults(config_entries, introspection.get("typed_defaults") or {})
@@ -4725,6 +4728,45 @@ def _auto_loaded_dependencies(domain: str, stem_or_key: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(dep for dep in collected if dep and dep not in seen))
 
 
+def _collect_bleed_keys(
+    manifest: Any,
+    platform_manifests_by_domain: list[tuple[str, Any]],
+) -> tuple[dict[str, set[tuple[str, ...]]], dict[str, set[tuple[str, ...]]]]:
+    """Per-domain hub signals a platform schema redefines, for platform builds to shed.
+
+    Ranges shed when the platform redefines the key unbounded; refined
+    types shed when the platform's own refinement differs (the
+    modbus_controller hub's ``cv.hex_uint8_t`` ``address`` vs the platform
+    item's plain ``cv.positive_int``). Keyed per platform domain, not
+    aggregated: one platform's redefinition must not spare a sibling
+    platform from the shed. Hub builds keep every signal. Covers
+    hub-to-platform bleed only; a sibling platform's contribution rides
+    ``merge_from_platforms`` unguarded.
+    """
+    hub_ranges = _collect_field_ranges(manifest)
+    hub_refined = _collect_refined_types(manifest)
+    range_bleed: dict[str, set[tuple[str, ...]]] = {}
+    refined_bleed: dict[str, set[tuple[str, ...]]] = {}
+    for domain, platform_manifest in platform_manifests_by_domain:
+        keys = _platform_field_keys([platform_manifest])
+        bounded = set(_collect_field_ranges(platform_manifest))
+        bled = {path for path in hub_ranges if path in keys and path not in bounded}
+        if bled:
+            range_bleed[domain] = bled
+        # Refined types walk list items, so the key set must too or the
+        # guard is blind to list-item paths.
+        list_keys = _platform_field_keys([platform_manifest], descend_list_items=True)
+        platform_refined = _collect_refined_types(platform_manifest)
+        refined_bled = {
+            path
+            for path in hub_refined
+            if path in list_keys and platform_refined.get(path) != hub_refined[path]
+        }
+        if refined_bled:
+            refined_bleed[domain] = refined_bled
+    return range_bleed, refined_bleed
+
+
 def introspect_component(component_id: str) -> dict[str, Any]:
     """
     Return ``{multi_conf, is_target_platform, platform_defaults, refined_types, auto_load}``.
@@ -4786,31 +4828,11 @@ def introspect_component(component_id: str) -> dict[str, Any]:
     registry_members = merge_from_platforms(_collect_registry_members)
     typed_defaults = merge_from_platforms(_collect_typed_defaults)
 
-    # A range bounded on the bare/hub manifest must not bleed onto a
-    # platform component's same-named-but-different field. ``address`` is
-    # the canonical case: the modbus_controller hub's ``cv.hex_uint8_t``
-    # device address (0–255) collides with the items' unbounded
-    # ``cv.positive_int`` register address. Flag hub-bounded keys that a
-    # platform schema redefines without bounding so platform builds can
-    # drop them (``build_component_entry``); hub builds keep them.
-    #
-    # Keyed per platform domain, not aggregated: one platform bounding a
-    # key must not spare a sibling platform that leaves the same key
-    # unbounded from shedding the hub's bound.
-    #
-    # Only an *unbounded* platform redefinition is shed (the ``not in
-    # bounded`` guard). A platform that re-bounds a shared key
-    # differently would still inherit the hub's bound, since
-    # ``merge_from_platforms`` is keep-first on the hub's field_ranges;
-    # no catalog component hits that case today.
-    hub_ranges = _collect_field_ranges(manifest)
-    field_range_bleed_keys: dict[str, set[tuple[str, ...]]] = {}
-    for domain, platform_manifest in platform_manifests_by_domain:
-        keys = _platform_field_keys([platform_manifest])
-        bounded = set(_collect_field_ranges(platform_manifest))
-        bled = {path for path in hub_ranges if path in keys and path not in bounded}
-        if bled:
-            field_range_bleed_keys[domain] = bled
+    # Hub signals must not bleed onto platform fields the domain
+    # redefines; platform builds shed them (``build_component_entry``).
+    field_range_bleed_keys, refined_bleed_keys = _collect_bleed_keys(
+        manifest, platform_manifests_by_domain
+    )
 
     return {
         "multi_conf": bool(getattr(manifest, "multi_conf", False)),
@@ -4819,6 +4841,7 @@ def introspect_component(component_id: str) -> dict[str, Any]:
         "platform_constraints": platform_constraints,
         "field_ranges": field_ranges,
         "field_range_bleed_keys": field_range_bleed_keys,
+        "refined_bleed_keys": refined_bleed_keys,
         "refined_types": refined_types,
         "component_gates": component_gates,
         "inclusive_groups": inclusive_groups,
@@ -6560,7 +6583,9 @@ def _apply_refined_types(
     Only acts on entries currently typed ``string`` so we don't
     override the schema's explicit type assignments — EXCEPT for
     ``float_with_unit``, which we always apply because it carries
-    extra info (``unit_options``) the schema bundle can't express.
+    extra info (``unit_options``) the schema bundle can't express,
+    and ``integer``-typed entries, which keep their type but take a
+    refined ``display_format``.
     The schema bundle's ``float`` typing for those entries is
     technically the runtime type after coercion, but the YAML shape
     the user types is a string with a unit suffix; the
@@ -6593,6 +6618,8 @@ def _apply_refined_types(
             else:
                 entry["type"] = new_type.type
                 _stamp_display_format(entry, new_type)
+        elif entry.get("type") == "integer":
+            _stamp_display_format(entry, new_type)
 
     _walk_catalog_entries(entries, visit)
 
@@ -7812,14 +7839,20 @@ def _drop_machine_derived_ranges(
     return {path: bounds for path, bounds in field_ranges.items() if path not in denylisted}
 
 
-def _platform_field_keys(platform_manifests: list[Any]) -> set[tuple[str, ...]]:
+def _platform_field_keys(
+    platform_manifests: list[Any], *, descend_list_items: bool = False
+) -> set[tuple[str, ...]]:
     """Every config-var key path defined across *platform_manifests*' schemas."""
     keys: set[tuple[str, ...]] = set()
     for manifest in platform_manifests:
         schema = getattr(manifest, "config_schema", None)
         if schema is None:
             continue
-        _walk_schema_keys(schema, lambda _k, _kn, _v, path: keys.add(path))
+        _walk_schema_keys(
+            schema,
+            lambda _k, _kn, _v, path: keys.add(path),
+            descend_list_items=descend_list_items,
+        )
     return keys
 
 

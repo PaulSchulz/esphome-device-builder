@@ -215,3 +215,80 @@ def test_missing_refined_type_validator_fails_the_sync() -> None:
 
     with pytest.raises(SystemExit, match=r"refined-type validator cv\."):
         _refined_type_tables(_StubCV())
+
+
+def test_hub_refinement_bleed_is_shed_for_platform_builds() -> None:
+    """A hub hex refinement is shed for a platform that redefines the key differently."""
+    from script.sync_components import introspect_component  # noqa: PLC0415
+
+    introspection = introspect_component("modbus_controller")
+    assert ("address",) in introspection.get("refined_bleed_keys", {}).get("sensor", set())
+
+
+def test_shipped_catalog_modbus_platform_address_stays_decimal() -> None:
+    """The platform item address keeps decimal display; the hub's hex does not bleed."""
+    body_path = _OUTPUT_BODIES_DIR / "sensor.modbus_controller.json"
+    body = json.loads(body_path.read_text(encoding="utf-8"))
+    entry = next(e for e in body["config_entries"] if e["key"] == "address")
+    assert entry["display_format"] is None
+
+
+def test_shipped_catalog_bundle_typed_hex_fields_gain_display() -> None:
+    """Hex-validated fields the bundle types integer now render hex."""
+    body = json.loads((_OUTPUT_BODIES_DIR / "sensor.ade7953_i2c.json").read_text(encoding="utf-8"))
+    entries = {e["key"]: e for e in body["config_entries"]}
+    assert entries["voltage_gain"]["display_format"] == "hex"
+    body = json.loads((_OUTPUT_BODIES_DIR / "uponor_smatrix.json").read_text(encoding="utf-8"))
+    entries = {e["key"]: e for e in body["config_entries"]}
+    assert entries["time_device_address"]["display_format"] == "hex"
+
+
+def test_refined_hex_display_stamps_integer_entries_without_retype() -> None:
+    """An integer-typed entry takes the hex display and keeps its type and range."""
+    entries = [{"key": "voltage_gain", "type": "integer", "display_format": None, "range": [0, 9]}]
+    refined = {("voltage_gain",): RefinedType("integer", display_format="hex")}
+    _apply_refined_types(entries, refined)
+    assert entries[0]["type"] == "integer"
+    assert entries[0]["display_format"] == "hex"
+    assert entries[0]["range"] == [0, 9]
+
+
+def test_refined_hex_display_never_clobbers_static_stamp() -> None:
+    """A ``data_type``-stamped entry keeps its static display format."""
+    entries = [{"key": "address", "type": "integer", "display_format": "hex"}]
+    refined = {("address",): RefinedType("integer", display_format="octal")}
+    _apply_refined_types(entries, refined)
+    assert entries[0]["display_format"] == "hex"
+
+
+def test_integer_branch_suppresses_stamp_on_options_entries() -> None:
+    """An options-backed integer enum takes no display stamp."""
+    entries = [
+        {
+            "key": "sync_value",
+            "type": "integer",
+            "display_format": None,
+            "options": [{"label": "170", "value": "170"}],
+        },
+    ]
+    refined = {("sync_value",): RefinedType("integer", display_format="hex")}
+    _apply_refined_types(entries, refined)
+    assert entries[0]["display_format"] is None
+
+
+def test_bleed_guard_sees_list_item_paths() -> None:
+    """A hub refinement inside a list item mapping is shed when a platform redefines it."""
+    from script.sync_components import _collect_bleed_keys  # noqa: PLC0415
+
+    hub = SimpleNamespace(
+        config_schema=cv.Schema(
+            {cv.Optional("items"): cv.ensure_list(cv.Schema({cv.Optional("addr"): cv.hex_int}))}
+        )
+    )
+    platform = SimpleNamespace(
+        config_schema=cv.Schema(
+            {cv.Optional("items"): cv.ensure_list(cv.Schema({cv.Optional("addr"): cv.string}))}
+        )
+    )
+    _range_bleed, refined_bleed = _collect_bleed_keys(hub, [("sensor", platform)])
+    assert ("items", "addr") in refined_bleed.get("sensor", set())
