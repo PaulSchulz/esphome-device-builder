@@ -5507,7 +5507,7 @@ _NON_METRIC_UNITS = frozenset({"fps", "°", "deg", "db", "dbm"})
 # ``%``-strip in ``percentage_int``), so there's no regex to introspect; the
 # only hand-maintained unit lists.
 _NON_INTROSPECTABLE_UNITS: dict[str, list[str]] = {
-    "data_size": ["B", "kB", "MB", "GB"],
+    "validate_bytes": ["B", "kB", "MB", "GB"],
     "temperature": ["°C", "°F", "K"],
     "temperature_delta": ["°C", "°F", "K"],
     # Canonical mireds first (cv.color_temperature stores mireds; "6500 K" coerces).
@@ -5524,19 +5524,17 @@ _UNIT_NORMALIZATION: Literal["NFC"] = "NFC"
 
 
 @cache
-def _present_non_introspectable_units(cv: Any) -> dict[str, list[str]]:
-    """``_NON_INTROSPECTABLE_UNITS`` entries still present in *cv*; warn on any gone.
-
-    A renamed/removed validator can't be rediscovered (no regex), so surface
-    it as sync-time telemetry rather than a silently missing picker.
-    """
-    present: dict[str, list[str]] = {}
-    for name, units in _NON_INTROSPECTABLE_UNITS.items():
-        if getattr(cv, name, None) is None:
-            _LOGGER.warning("hand-maintained unit validator cv.%s is gone; picker dropped", name)
-        else:
-            present[name] = units
-    return present
+def _require_non_introspectable_units(cv: Any) -> dict[str, list[str]]:
+    """Return the hand-maintained unit lists; a validator missing from *cv* fails the sync."""
+    missing = [name for name in _NON_INTROSPECTABLE_UNITS if getattr(cv, name, None) is None]
+    if missing:
+        # SystemExit so the per-file blanket ``except Exception`` in
+        # ``build_catalog`` can't swallow it into a gutted-but-green sync.
+        raise SystemExit(
+            f"hand-maintained unit validators gone from esphome: {missing} — "
+            "renamed upstream? Update _NON_INTROSPECTABLE_UNITS."
+        )
+    return dict(_NON_INTROSPECTABLE_UNITS)
 
 
 def _extract_validator_units(validator: Any) -> list[str] | None:
@@ -5766,7 +5764,7 @@ def _collect_refined_types(  # noqa: C901
     add("float_range", RefinedType("float"), "float_range")
     # Non-closure unit validators only; real float_with_unit ones are
     # discovered in ``classify`` below via ``__qualname__``.
-    for validator_name, units in _present_non_introspectable_units(cv).items():
+    for validator_name, units in _require_non_introspectable_units(cv).items():
         add(
             validator_name,
             RefinedType("float_with_unit", unit_options=units),

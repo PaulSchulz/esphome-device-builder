@@ -28,7 +28,7 @@ from script.sync_components import (  # type: ignore[import-not-found]
     _derive_suffix_units,
     _enumerate_platform_manifests,
     _extract_validator_units,
-    _present_non_introspectable_units,
+    _require_non_introspectable_units,
     _walk_schema_keys,
 )
 
@@ -361,7 +361,7 @@ def test_resistance_sensor_resistor_refines_to_float_with_unit(loader) -> None:
 
 def test_non_introspectable_units_include_color_temperature(cv) -> None:
     """`cv.color_temperature` is a hand-rolled `def` (no regex), curated as mireds/K."""
-    present = _present_non_introspectable_units(cv)
+    present = _require_non_introspectable_units(cv)
     assert present["color_temperature"] == ["mireds", "K"]
 
 
@@ -387,21 +387,18 @@ def test_rgbww_color_temperature_refines_to_float_with_unit(loader) -> None:
     assert warm.unit_options == ["mireds", "K"]
 
 
-def test_missing_non_introspectable_validator_warns(caplog) -> None:
-    """A removed hand-maintained validator warns and is dropped, not silently missing."""
+def test_missing_non_introspectable_validator_fails_the_sync() -> None:
+    """A removed hand-maintained validator raises instead of silently dropping a picker."""
 
     class _StubCV:
-        data_size = object()
+        validate_bytes = object()
         temperature = object()
         color_temperature = object()
         percentage_int = object()
         # temperature_delta removed
 
-    with caplog.at_level(logging.WARNING, logger="sync_components"):
-        present = _present_non_introspectable_units(_StubCV())
-    assert "temperature_delta" in caplog.text
-    assert "temperature_delta" not in present
-    assert {"data_size", "temperature", "color_temperature"} <= present.keys()
+    with pytest.raises(SystemExit, match="temperature_delta"):
+        _require_non_introspectable_units(_StubCV())
 
 
 def test_walk_descends_typed_schema_branches(cv) -> None:
@@ -581,8 +578,22 @@ def test_shipped_catalog_stepper_speed_fields_carry_units() -> None:
 
 def test_non_introspectable_units_include_percentage_int(cv) -> None:
     """`cv.percentage_int` is a hand-rolled `def` (no regex), curated as `%`."""
-    present = _present_non_introspectable_units(cv)
+    present = _require_non_introspectable_units(cv)
     assert present["percentage_int"] == ["%"]
+
+
+def test_non_introspectable_units_include_validate_bytes(cv) -> None:
+    """`cv.validate_bytes` (inline regex, no closure) is curated as B/kB/MB/GB."""
+    present = _require_non_introspectable_units(cv)
+    assert present["validate_bytes"] == ["B", "kB", "MB", "GB"]
+
+
+def test_shipped_catalog_buffer_size_carries_byte_units() -> None:
+    """The generated remote_receiver body renders buffer_size with a byte picker."""
+    body = orjson.loads((_OUTPUT_BODIES_DIR / "remote_receiver.json").read_bytes())
+    entries = {e["key"]: e for e in body["config_entries"]}
+    assert entries["buffer_size"]["type"] == "float_with_unit"
+    assert entries["buffer_size"]["unit_options"] == ["B", "kB", "MB", "GB"]
 
 
 def test_collect_refined_types_percentage_int(cv) -> None:
