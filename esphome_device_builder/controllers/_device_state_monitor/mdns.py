@@ -218,27 +218,32 @@ class MdnsSource:
         Read the truthful "last heard via mDNS" age + remaining TTL.
 
         Walks every record type the device might leave in the
-        cache (A / AAAA at ``<name>.local.``, SRV / TXT at
-        ``<name>._esphomelib._tcp.local.``, PTR at the type-
-        domain). The drawer's "Last seen" reads whichever is
-        freshest: A/AAAA decay at 120s, but the PTR kept alive
-        by the browser stays fresh for tens of minutes, so the
-        row stays populated through the brief A-expiry window
-        instead of flickering "Waiting for first broadcast".
-        Returns ``None`` only when *every* cached record has
-        been evicted.
+        cache (A / AAAA at ``<name>.local.``, SRV / TXT / PTR on
+        both service types — esphomelib for api devices,
+        ``_http._tcp`` for non-API). The drawer's "Last seen"
+        reads whichever is freshest: A/AAAA decay at 120s, but
+        the PTR kept alive by the browser stays fresh for tens
+        of minutes, so the row stays populated through the brief
+        A-expiry window instead of flickering "Waiting for first
+        broadcast". Returns ``None`` only when *every* cached
+        record has been evicted.
         """
         if self._zeroconf is None:
             return None
         cache = self._zeroconf.zeroconf.cache
-        service_name = f"{name}.{_ESPHOME_SERVICE_TYPE}"
-        txt_dns_records = list(cache.get_all_by_details(service_name, _TYPE_TXT, _CLASS_IN))
-        records: list[DNSRecord] = [
-            *self._get_address_records(name),
-            *cache.get_all_by_details(service_name, _TYPE_SRV, _CLASS_IN),
-            *txt_dns_records,
-        ]
-        ptr = self._cached_ptr(service_name)
+        # Decode TXT per service, esphomelib first — one freshest-of-both
+        # pick could surface web_server's contentless TXT over the
+        # identity TXT on an api+web_server device.
+        txt_dns_records: list[DNSRecord] = []
+        records: list[DNSRecord] = [*self._get_address_records(name)]
+        for service_type in (_ESPHOME_SERVICE_TYPE, _HTTP_SERVICE_TYPE):
+            service_name = f"{name}.{service_type}"
+            txts = list(cache.get_all_by_details(service_name, _TYPE_TXT, _CLASS_IN))
+            txt_dns_records = txt_dns_records or txts
+            records.extend(cache.get_all_by_details(service_name, _TYPE_SRV, _CLASS_IN))
+            records.extend(txts)
+        # The expiry countdown rides the ownership anchor.
+        ptr = self._anchor_ptr(name)
         if ptr is not None:
             records.append(ptr)
         if not records:
@@ -316,6 +321,10 @@ class MdnsSource:
         if props := self._cached_txt_properties(f"{device_name}.{_HTTP_SERVICE_TYPE}"):
             self._apply_http_identity_props(device_name, props)
 
+    def has_live_anchor_ptr(self, device_name: str) -> bool:
+        """Whether a PTR that can anchor *device_name*'s mdns claim is unexpired."""
+        return self._anchor_ptr(device_name) is not None
+
     def has_live_http_identity_txt(self, device_name: str) -> bool:
         """Whether the cache holds an unexpired ``_http._tcp`` TXT carrying identity keys."""
         return _has_identity_keys(
@@ -350,8 +359,8 @@ class MdnsSource:
         """
         Whether the cache holds any record for *name*, expired included.
 
-        Same record buckets as :meth:`get_mdns_cache_info`; keep the
-        two in lockstep. Sweep-side verify resolves gate on it: an
+        Same per-service record buckets as :meth:`get_mdns_cache_info`
+        (which walks both service types). Sweep-side verify resolves gate on it: an
         mDNS-dark deployment leaves no trace, and a wire miss there
         proves nothing. *service_type* narrows only the
         service-instance buckets — cached A/AAAA records count as a
@@ -467,7 +476,7 @@ class MdnsSource:
             return
 
         if state_change == ServiceStateChange.Removed:
-            self._on_service_removed(name, device_name)
+            self._on_service_removed(name, device_name, sibling_type=_HTTP_SERVICE_TYPE)
             return
 
         # Don't claim ONLINE off a bare PTR — only once the service
@@ -494,13 +503,22 @@ class MdnsSource:
             self._on_http_service_state_change(zeroconf, service_type, name, state_change)
             importable.on_http_service_state_change(zeroconf, service_type, name, state_change)
 
-    def _on_service_removed(self, name: str, device_name: str) -> None:
-        """Withdraw the mDNS claim and wake the ping sweep to decide."""
+    def _on_service_removed(self, name: str, device_name: str, *, sibling_type: str) -> None:
+        """Note *name*'s withdrawal, then release the claim unless the sibling anchor survives."""
+        # Deferred or not, an in-flight resolve of this service must
+        # discard records that predate the goodbye.
+        self._withdrawal_epochs[name] = self._withdrawal_epochs.get(name, 0) + 1
+        # A live sibling PTR re-anchors the election (an
+        # api+web_server bucket losing only one of its services);
+        # withdraw only when no anchor remains. A goodbye burst byes
+        # both services in one packet, so a sleeper's first Removed
+        # already sees the sibling PTR evicted.
+        if self._has_live_ptr(device_name, sibling_type):
+            return
         # A goodbye withdraws only the PTR (firmware never byes SRV/A,
         # which stay cached for their full TTLs), so a verify-resolve
         # here would vouch for a sleeping device straight off the cache
         # and latch it ONLINE (#2369, #1776).
-        self._withdrawal_epochs[name] = self._withdrawal_epochs.get(name, 0) + 1
         monitor = self._monitor
         monitor.source_withdrawn(device_name, "mdns")
         monitor.probe_device_ping(device_name)
@@ -577,19 +595,32 @@ class MdnsSource:
         fallback and web_server's service when the API is absent;
         older firmware carries ``version`` only.
         Skipped when every config for the name exposes the API (the
-        esphomelib path carries their identity, and the ``_http`` TXT
-        isn't published with the API on). No ONLINE claim; reachability
-        stays owned by the active-resolve / MQTT / ping paths.
+        esphomelib path carries their identity and reachability, and
+        the ``_http`` TXT isn't published with the API on). No ONLINE
+        claim; a ``Removed`` withdraws an mdns claim this PTR
+        anchored, and promotion stays owned by the active-resolve /
+        MQTT / ping paths.
         """
-        if state_change == ServiceStateChange.Removed:
-            return
         monitor = self._monitor
         device_name = device_name_from_service(name)
         # Look at the whole name bucket, not just bucket[0]: sibling
         # YAMLs can share an ``esphome.name`` (a config + a ``foo (1)``
-        # copy), and an all-API bucket is the only one to skip.
+        # copy). An all-API bucket skips only the identity path below;
+        # a ``Removed`` is evidence-gated instead (an api+web_server
+        # bucket publishes both PTRs).
         bucket = monitor._get_devices_by_name(device_name)
-        if not bucket or all(device.api_enabled for device in bucket):
+        if not bucket:
+            return
+        if state_change == ServiceStateChange.Removed:
+            # Keyed on the evidence, not the YAML: the ``api_enabled``
+            # union reads raw YAML text while the claim gates on the
+            # last compile's ``loaded_integrations``, and a
+            # compiled-without-api device whose YAML gained ``api:``
+            # must still withdraw. ``source_withdrawn`` itself no-ops
+            # for a name mdns doesn't own.
+            self._on_service_removed(name, device_name, sibling_type=_ESPHOME_SERVICE_TYPE)
+            return
+        if all(device.api_enabled for device in bucket):
             return
         info = AsyncServiceInfo(service_type, name)
         self.cache_apply_or_resolve(zeroconf, info, device_name, self._apply_http_txt)
@@ -609,6 +640,23 @@ class MdnsSource:
         self._apply_identity_txt(device_name, props)
         if _has_identity_keys(props):
             self._monitor.apply_deployed_identity_live(device_name, live=True)
+
+    def _anchor_ptr(self, device_name: str) -> DNSRecord | None:
+        """
+        Return the PTR anchoring *device_name*'s mdns claim, if live.
+
+        The esphomelib PTR wins while it is live — the broadcast, not
+        the YAML, proves the firmware has the API — else the
+        ``_http._tcp`` PTR. A ``Removed`` of the winner re-opens the
+        election on the next read.
+        """
+        return self._cached_ptr(f"{device_name}.{_ESPHOME_SERVICE_TYPE}") or self._cached_ptr(
+            f"{device_name}.{_HTTP_SERVICE_TYPE}", _HTTP_SERVICE_TYPE
+        )
+
+    def _has_live_ptr(self, device_name: str, service_type: str) -> bool:
+        """Whether the cache holds an unexpired *service_type* PTR for *device_name*."""
+        return self._cached_ptr(f"{device_name}.{service_type}", service_type) is not None
 
     def _cached_ptr(
         self, service_name: str, service_type: str = _ESPHOME_SERVICE_TYPE

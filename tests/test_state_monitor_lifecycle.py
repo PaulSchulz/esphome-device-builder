@@ -491,6 +491,8 @@ async def test_dispatch_removed_event_marks_unknown_keeps_last_known_ip(
     dispatch = await _start_with_captured_dispatch(monitor, monkeypatch)
     monkeypatch.setattr(monitor.ping, "wake", MagicMock())
     monitor.ping.icmp_available = True
+    # No live sibling PTR to defer the withdrawal to.
+    monitor.mdns._zeroconf.zeroconf.cache.current_entry_with_name_and_alias.return_value = None
     try:
         dispatch(
             monitor.mdns._zeroconf.zeroconf,
@@ -521,6 +523,8 @@ async def test_dispatch_removed_event_keeps_channel_freshness(
     dispatch = await _start_with_captured_dispatch(monitor, monkeypatch)
     monkeypatch.setattr(monitor.ping, "wake", MagicMock())
     monitor.ping.icmp_available = True
+    # No live sibling PTR to defer the withdrawal to.
+    monitor.mdns._zeroconf.zeroconf.cache.current_entry_with_name_and_alias.return_value = None
     try:
         dispatch(
             monitor.mdns._zeroconf.zeroconf,
@@ -1882,13 +1886,26 @@ def test_source_withdrawn_skips_the_state_apply_for_a_confirmed_offline_bucket()
     """An already-OFFLINE device keeps its verdict; only the ledger is released."""
     device = _device(state=DeviceState.OFFLINE, ip="10.0.0.1", ip_addresses=["10.0.0.1"])
     monitor, callbacks = _make_monitor([device])
-    monitor.state.state_source["kitchen"] = "ping"
+    monitor.state.state_source["kitchen"] = "mdns"
 
     monitor.source_withdrawn("kitchen", "mdns")
 
     assert device.runtime_state.state is DeviceState.OFFLINE
     assert callbacks.calls_for("on_state_change") == []
     assert monitor.state.state_source == {}
+
+
+def test_source_withdrawn_is_a_no_op_for_a_source_that_does_not_own_the_name() -> None:
+    """A source releases only a claim it holds."""
+    device = _device(state=DeviceState.ONLINE, ip="10.0.0.1", ip_addresses=["10.0.0.1"])
+    monitor, callbacks = _make_monitor([device])
+    monitor.state.state_source["kitchen"] = "mqtt"
+
+    monitor.source_withdrawn("kitchen", "mdns")
+
+    assert device.runtime_state.state is DeviceState.ONLINE
+    assert monitor.state.state_source["kitchen"] == "mqtt"
+    assert callbacks.calls == []
 
 
 @pytest.mark.parametrize(

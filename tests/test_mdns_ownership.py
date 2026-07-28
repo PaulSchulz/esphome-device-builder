@@ -137,8 +137,13 @@ async def test_added_after_removed_reclaims_mdns_and_outranks_a_late_ping_miss(
     monitor.state.state_source["kitchen"] = ReachabilitySource.MDNS
     _prime_removed(monitor)
     stub_async_service_info(monkeypatch, cached=True)
-    # The re-announce lands a live PTR, opening the cache-claim gate.
-    monitor.mdns._zeroconf = MagicMock()
+    # The re-announce lands a live esphomelib PTR (no http sibling),
+    # opening the cache-claim gate without deferring the withdrawal.
+    zc = MagicMock()
+    zc.zeroconf.cache.current_entry_with_name_and_alias.side_effect = lambda type_, _alias: (
+        MagicMock() if type_ == "_esphomelib._tcp.local." else None
+    )
+    monitor.mdns._zeroconf = zc
 
     _dispatch_removed(monitor)
     assert device.runtime_state.state == DeviceState.UNKNOWN
@@ -183,8 +188,8 @@ async def test_removed_before_the_icmp_probe_demotes_offline() -> None:
     assert "kitchen" not in monitor.state.state_source
 
 
-async def test_removed_on_an_offline_device_keeps_the_confirmed_state() -> None:
-    """A late PTR expiry can't un-confirm a ping-settled OFFLINE."""
+async def test_removed_on_a_ping_settled_device_is_a_no_op() -> None:
+    """A late PTR expiry can't un-confirm a ping-settled OFFLINE or touch its ledger."""
     device = make_online_api_device(state=DeviceState.OFFLINE)
     monitor, callbacks = make_state_monitor_with_callbacks([device])
     monitor.state.state_source["kitchen"] = ReachabilitySource.PING
@@ -194,11 +199,11 @@ async def test_removed_on_an_offline_device_keeps_the_confirmed_state() -> None:
 
     assert device.runtime_state.state == DeviceState.OFFLINE
     assert callbacks.calls_for("on_state_change") == []
-    assert "kitchen" not in monitor.state.state_source
+    assert monitor.state.state_source["kitchen"] == ReachabilitySource.PING
 
 
-async def test_removed_with_a_lower_priority_owner_emits_one_source_change() -> None:
-    """The withdrawal never stamps transient mdns ownership over a ping-owned ledger."""
+async def test_removed_leaves_a_ping_owned_online_device_alone() -> None:
+    """MDNS withdraws only a claim it holds; a ping-owned device keeps its state."""
     device = make_online_api_device()
     monitor, callbacks = make_state_monitor_with_callbacks([device])
     monitor.state.state_source["kitchen"] = ReachabilitySource.PING
@@ -206,10 +211,9 @@ async def test_removed_with_a_lower_priority_owner_emits_one_source_change() -> 
 
     _dispatch_removed(monitor)
 
-    assert device.runtime_state.state == DeviceState.UNKNOWN
-    assert callbacks.calls_for("on_source_change") == [
-        ("on_source_change", "kitchen", ReachabilitySource.UNKNOWN),
-    ]
+    assert device.runtime_state.state == DeviceState.ONLINE
+    assert monitor.state.state_source["kitchen"] == ReachabilitySource.PING
+    assert callbacks.calls_for("on_source_change") == []
 
 
 async def test_resolve_overlapping_a_withdrawal_does_not_reclaim(
@@ -348,7 +352,11 @@ async def test_readd_after_withdrawal_returns_vouching_to_the_announce(
     monitor.state.state_source["kitchen"] = ReachabilitySource.MDNS
     _prime_removed(monitor)
     stub_async_service_info(monkeypatch, cached=True)
-    monitor.mdns._zeroconf = MagicMock()
+    zc = MagicMock()
+    zc.zeroconf.cache.current_entry_with_name_and_alias.side_effect = lambda type_, _alias: (
+        MagicMock() if type_ == "_esphomelib._tcp.local." else None
+    )
+    monitor.mdns._zeroconf = zc
 
     _dispatch_removed(monitor)
     assert device.runtime_state.deployed_identity_live is True
@@ -381,3 +389,150 @@ async def test_wire_resolve_without_live_ptr_applies_data_but_takes_no_ownership
     assert device.runtime_state.state == DeviceState.UNKNOWN
     assert "kitchen" not in monitor.state.state_source
     assert device.runtime_state.deployed_version == "2026.7.0"
+
+
+def _dispatch_http_removed(monitor: Any) -> None:
+    monitor.mdns._on_http_service_state_change(
+        MagicMock(),
+        "_http._tcp.local.",
+        "kitchen._http._tcp.local.",
+        mdns_module.ServiceStateChange.Removed,
+    )
+
+
+async def test_http_removed_withdraws_a_non_api_bucket() -> None:
+    """The ``_http._tcp`` PTR anchors non-API ownership; its Removed withdraws."""
+    device = make_online_api_device(api_enabled=False, loaded_integrations=["web_server", "wifi"])
+    monitor, _callbacks = make_state_monitor_with_callbacks([device])
+    monitor.state.state_source["kitchen"] = ReachabilitySource.MDNS
+    _prime_removed(monitor)
+
+    _dispatch_http_removed(monitor)
+
+    assert device.runtime_state.state == DeviceState.UNKNOWN
+    assert "kitchen" not in monitor.state.state_source
+    monitor.ping.wake.assert_called_once()
+
+
+async def test_http_removed_defers_to_a_live_esphomelib_ptr() -> None:
+    """The esphomelib lifecycle owns the name while its PTR is live."""
+    device = make_online_api_device()
+    monitor, callbacks = make_state_monitor_with_callbacks([device])
+    monitor.state.state_source["kitchen"] = ReachabilitySource.MDNS
+    _prime_removed(monitor)
+    zc = MagicMock()
+    zc.zeroconf.cache.current_entry_with_name_and_alias.side_effect = lambda type_, _alias: (
+        MagicMock() if type_ == "_esphomelib._tcp.local." else None
+    )
+    monitor.mdns._zeroconf = zc
+
+    _dispatch_http_removed(monitor)
+
+    assert device.runtime_state.state == DeviceState.ONLINE
+    assert monitor.state.state_source["kitchen"] == ReachabilitySource.MDNS
+    assert callbacks.calls_for("on_state_change") == []
+
+
+async def test_http_removed_withdraws_when_yaml_gained_api_but_firmware_lacks_it() -> None:
+    """The withdrawal keys on evidence, not the ``api_enabled`` YAML union."""
+    device = make_online_api_device(loaded_integrations=["wifi"])
+    assert device.api_enabled is True
+    monitor, _callbacks = make_state_monitor_with_callbacks([device])
+    monitor.state.state_source["kitchen"] = ReachabilitySource.MDNS
+    _prime_removed(monitor)
+
+    _dispatch_http_removed(monitor)
+
+    assert device.runtime_state.state == DeviceState.UNKNOWN
+    assert "kitchen" not in monitor.state.state_source
+
+
+async def test_esphomelib_removed_defers_to_a_live_http_ptr() -> None:
+    """Losing the esphomelib PTR re-anchors the election on a live http PTR."""
+    device = make_online_api_device()
+    monitor, callbacks = make_state_monitor_with_callbacks([device])
+    monitor.state.state_source["kitchen"] = ReachabilitySource.MDNS
+    _prime_removed(monitor)
+    zc = MagicMock()
+    zc.zeroconf.cache.current_entry_with_name_and_alias.side_effect = lambda type_, _alias: (
+        MagicMock() if type_ == "_http._tcp.local." else None
+    )
+    monitor.mdns._zeroconf = zc
+
+    _dispatch_removed(monitor)
+
+    assert device.runtime_state.state == DeviceState.ONLINE
+    assert monitor.state.state_source["kitchen"] == ReachabilitySource.MDNS
+    assert callbacks.calls_for("on_state_change") == []
+
+
+async def test_deferred_removed_still_discards_an_overlapping_resolve() -> None:
+    """A ``Removed`` bumps the withdrawal epoch even when the sibling anchor defers it."""
+    device = make_online_api_device()
+    monitor, _callbacks = make_state_monitor_with_callbacks([device])
+    monitor.state.state_source["kitchen"] = ReachabilitySource.MDNS
+    _prime_removed(monitor)
+    zc = MagicMock()
+    zc.zeroconf.cache.current_entry_with_name_and_alias.side_effect = lambda type_, _alias: (
+        MagicMock() if type_ == "_http._tcp.local." else None
+    )
+    monitor.mdns._zeroconf = zc
+    gate = asyncio.Event()
+    info = MagicMock()
+    info.name = _SERVICE_NAME
+    info.type = "_esphomelib._tcp.local."
+
+    async def slow_request(*_args: Any, **_kwargs: Any) -> bool:
+        await gate.wait()
+        return True
+
+    info.async_request = slow_request
+    applied: list[str] = []
+    task = asyncio.ensure_future(
+        monitor.mdns.resolve_then(
+            MagicMock(), info, "kitchen", lambda name, _info: applied.append(name)
+        )
+    )
+    await asyncio.sleep(0)
+
+    _dispatch_removed(monitor)
+    assert monitor.state.state_source["kitchen"] == ReachabilitySource.MDNS
+    gate.set()
+
+    assert await task is None
+    assert applied == []
+
+
+async def test_http_removed_leaves_an_mqtt_owned_name_alone() -> None:
+    """A name mdns doesn't own has nothing to withdraw; the broker's vouch stands."""
+    device = make_online_api_device(api_enabled=False, loaded_integrations=["mqtt", "wifi"])
+    monitor, callbacks = make_state_monitor_with_callbacks([device])
+    monitor.state.state_source["kitchen"] = ReachabilitySource.MQTT
+    _prime_removed(monitor)
+
+    _dispatch_http_removed(monitor)
+
+    assert device.runtime_state.state == DeviceState.ONLINE
+    assert monitor.state.state_source["kitchen"] == ReachabilitySource.MQTT
+    assert callbacks.calls_for("on_state_change") == []
+
+
+def test_anchor_ptr_elects_esphomelib_first_then_http() -> None:
+    """The anchor election: esphomelib wins while live, else http, else nothing."""
+    monitor, _callbacks = make_state_monitor_with_callbacks([make_online_api_device()])
+    zc = MagicMock()
+    monitor.mdns._zeroconf = zc
+    lookup = zc.zeroconf.cache.current_entry_with_name_and_alias
+    esphomelib_ptr = MagicMock()
+    http_ptr = MagicMock()
+
+    both = {"_esphomelib._tcp.local.": esphomelib_ptr, "_http._tcp.local.": http_ptr}
+    for live, winner in [
+        (both, esphomelib_ptr),
+        ({"_http._tcp.local.": http_ptr}, http_ptr),
+        ({"_esphomelib._tcp.local.": esphomelib_ptr}, esphomelib_ptr),
+        ({}, None),
+    ]:
+        lookup.side_effect = lambda type_, _alias, _live=live: _live.get(type_)
+        assert monitor.mdns._anchor_ptr("kitchen") is winner, live
+        assert monitor.mdns.has_live_anchor_ptr("kitchen") is (winner is not None), live
