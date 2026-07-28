@@ -5222,21 +5222,55 @@ def _strip_entry_defaults(entry: dict) -> dict:
     return out
 
 
+def _is_extractor_closure(node: Any) -> bool:
+    """Report whether *node* is a callable whose code references ``SCHEMA_EXTRACT``."""
+    code = getattr(node, "__code__", None)
+    return code is not None and "SCHEMA_EXTRACT" in code.co_names
+
+
 def _hidden_schema(node: Any) -> Any | None:
     """
     Return the schema a ``@schema_extractor`` closure yields for ``SCHEMA_EXTRACT``, else None.
 
-    Only callables whose code references ``SCHEMA_EXTRACT`` are probed.
+    Only callables whose code references ``SCHEMA_EXTRACT`` are probed;
+    repeated probes of one closure return one object.
     """
-    code = getattr(node, "__code__", None)
-    if code is None or "SCHEMA_EXTRACT" not in code.co_names:
-        return None
+    return _probe_hidden_schema(node) if _is_extractor_closure(node) else None
+
+
+@cache
+def _probe_hidden_schema(node: Any) -> Any | None:
+    """
+    Probe *node* with the ``SCHEMA_EXTRACT`` sentinel, once per closure.
+
+    A wrapper closure builds a fresh schema per call (validate_triggers
+    extends its base each time), which would defeat the walker's
+    (id, path) dedupe and re-expand recursive schemas (lvgl)
+    combinatorially without the cache.
+    """
     from esphome.schema_extractors import SCHEMA_EXTRACT
 
     try:
         return node(SCHEMA_EXTRACT)
     except Exception:
         return None
+
+
+def _delegated_schema(node: Any) -> Any | None:
+    """Return the sole module-level ``vol.Schema`` a plain wrapper references, else None."""
+    code = getattr(node, "__code__", None)
+    if code is None:
+        return None
+    globs = getattr(node, "__globals__", {})
+    found: vol.Schema | None = None
+    for name in code.co_names:
+        value = globs.get(name)
+        if not isinstance(value, vol.Schema) or value is found:
+            continue
+        if found is not None:
+            return None
+        found = value
+    return found
 
 
 def _unwrap_schema_to_dict(node: Any) -> dict | None:
@@ -5251,6 +5285,7 @@ def _unwrap_schema_to_dict(node: Any) -> dict | None:
     stops descending into nested ``vol.All`` values like ``wifi.eap``.
     Prefer the ``validators`` tuple (the source of truth on compound
     validators), falling back to ``.schema`` for plain ``vol.Schema``.
+    Wrapper closures peel only to a ``vol.Schema`` result.
     """
     for _ in range(8):
         if isinstance(node, dict):
@@ -5267,6 +5302,19 @@ def _unwrap_schema_to_dict(node: Any) -> dict | None:
             continue
         if hasattr(node, "schema"):
             node = node.schema
+            continue
+        if _is_extractor_closure(node):
+            hidden = _probe_hidden_schema(node)
+            # Schema-only: a hidden extract can be a non-schema — cv.enum
+            # yields its bare value mapping, which the dict branch above
+            # would walk as config keys.
+            if isinstance(hidden, vol.Schema):
+                node = hidden
+                continue
+            return None
+        delegated = _delegated_schema(node)
+        if delegated is not None:
+            node = delegated
             continue
         return None
     return None
@@ -5349,13 +5397,6 @@ def _walk_schema_keys(
             sub_path = (*path, key_name)
             visit(key, key_name, val, sub_path)
             walk(val, sub_path, depth + 1)
-
-    # Top-level only: a nested peel explodes on recursive closure-built
-    # schemas (lvgl) — each call constructs fresh objects, so the
-    # (id, path) dedupe never hits and the walk grows combinatorially.
-    # It also mis-reads non-schema extracts: cv.enum yields its bare
-    # value mapping, which would walk enum values as config keys.
-    schema = _hidden_schema(schema) or schema
 
     # Best-effort: don't tank the whole sync if one component
     # manifest's schema is misshapen. Log at debug level so we can
@@ -6066,7 +6107,7 @@ def _collect_typed_defaults(manifest: Any) -> dict[tuple[str, ...], Any]:
     schema = getattr(manifest, "config_schema", None)
     if schema is None:
         return {}
-    found = _typed_default_of(schema)
+    found = _typed_default_of(_hidden_schema(schema) or schema)
     if found is None:
         return {}
     typed_key, default = found
