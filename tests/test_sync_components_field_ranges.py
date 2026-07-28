@@ -30,6 +30,7 @@ real upstream shapes.
 
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 
@@ -38,9 +39,12 @@ import pytest
 import voluptuous as vol
 
 from script.sync_components import (  # type: ignore[import-not-found]
+    _AUTOMATIONS_BODIES_DIR,
     _MACHINE_DERIVED_RANGE_FIELDS,
     _apply_field_ranges,
+    _collect_automation_field_ranges,
     _collect_field_ranges,
+    _field_ranges_in_schema,
     _numeric_range_bounds,
     _platform_field_keys,
     _walk_entries,
@@ -425,3 +429,25 @@ def test_apply_warns_on_dropped_bounds(caplog: pytest.LogCaptureFixture) -> None
         _apply_field_ranges(entries, {("memory_address",): (0, 255)}, "sensor.micronova")
     assert "sensor.micronova" in caplog.text
     assert "memory_address (string)" in caplog.text
+
+
+def test_field_ranges_in_schema_accepts_bare_schema() -> None:
+    """The schema-accepting core walks a schema with no manifest wrapper."""
+    schema = cv.Schema({cv.Required("level"): cv.int_range(min=1, max=15)})
+    assert _field_ranges_in_schema(schema) == {("level",): (1, 15)}
+
+
+def test_collect_automation_field_ranges_live() -> None:
+    """The live action registry yields canbus.send's 29-bit can_id bound."""
+    importlib.import_module("esphome.components.canbus")
+    ranges = _collect_automation_field_ranges()
+    assert ranges["action"]["canbus.send"][("can_id",)] == (0, 0x1FFFFFFF)
+
+
+def test_shipped_automations_canbus_send_carries_range() -> None:
+    """The generated canbus.send body bounds can_id."""
+    body_path = _AUTOMATIONS_BODIES_DIR / "actions" / "canbus.send.json"
+    body = json.loads(body_path.read_text(encoding="utf-8"))
+    entry = next(e for e in body["config_entries"] if e["key"] == "can_id")
+    assert entry["type"] == "integer"
+    assert entry["range"] == [0, 536870911]
