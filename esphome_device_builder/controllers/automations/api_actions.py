@@ -108,19 +108,25 @@ def canonicalize_block(
     item_indent: str,
     matched_key: str,
 ) -> list[str]:
-    """Respell the block key and item discriminators to canonical, line for line.
+    """
+    Respell the block key and item discriminators to canonical, line for line.
 
     Only the key tokens change; discriminators are matched on the dash
     line or at the item's child indent only, so a same-named key inside
-    an action body stays untouched.
+    an action body stays untouched. An item already carrying the
+    canonical discriminator keeps its legacy one.
     """
     out = list(lines)
     out[actions_start] = re.sub(
         rf"^(\s*){re.escape(matched_key)}:", rf"\g<1>{BLOCK_KEYS[0]}:", out[actions_start], count=1
     )
     item_re = re.compile(rf"^({re.escape(item_indent)}(?:-\s*|  ))(?:{_LEGACY_ITEM_KEY_ALT}):")
-    for idx in range(actions_start + 1, actions_end):
-        out[idx] = item_re.sub(rf"\g<1>{ITEM_KEYS[0]}:", out[idx], count=1)
+    canonical_re = re.compile(rf"^{re.escape(item_indent)}(?:-\s*|  ){ITEM_KEYS[0]}:")
+    for start, end in _item_spans(out, actions_start, actions_end, item_indent):
+        if any(canonical_re.match(out[idx].rstrip("\n\r")) for idx in range(start, end)):
+            continue
+        for idx in range(start, end):
+            out[idx] = item_re.sub(rf"\g<1>{ITEM_KEYS[0]}:", out[idx], count=1)
     return out
 
 
@@ -132,17 +138,14 @@ def find_item(
     action_name: str,
 ) -> tuple[int, int] | None:
     """Locate the line range of the list item whose discriminator matches."""
-    item_starts: list[int] = []
-    for idx in range(actions_start + 1, actions_end):
-        raw = lines[idx].rstrip("\n\r")
-        if not raw.startswith(item_indent + "- "):
-            continue
-        item_starts.append(idx)
-    for run, start in enumerate(item_starts):
-        end = item_starts[run + 1] if run + 1 < len(item_starts) else actions_end
-        if _discriminator(lines, start, end, item_indent) == action_name:
-            return start, end
-    return None
+    return next(
+        (
+            span
+            for span in _item_spans(lines, actions_start, actions_end, item_indent)
+            if _discriminator(lines, *span, item_indent) == action_name
+        ),
+        None,
+    )
 
 
 def count_siblings(
@@ -154,15 +157,11 @@ def count_siblings(
 ) -> int:
     """Count list items at *item_indent* that aren't the matched span."""
     item_start, item_end = matched
-    siblings = 0
-    for idx in range(actions_start + 1, actions_end):
-        raw = lines[idx].rstrip("\n\r")
-        if not raw.startswith(item_indent + "- "):
-            continue
-        if item_start <= idx < item_end:
-            continue
-        siblings += 1
-    return siblings
+    return sum(
+        1
+        for start, _end in _item_spans(lines, actions_start, actions_end, item_indent)
+        if not item_start <= start < item_end
+    )
 
 
 def indent_for_list(rendered_item: str, item_indent: str) -> str:
@@ -290,6 +289,25 @@ def render_delete_actions_key(
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
+
+
+def _item_spans(
+    lines: list[str],
+    actions_start: int,
+    actions_end: int,
+    item_indent: str,
+) -> list[tuple[int, int]]:
+    """Return each list item's ``(start, end)`` line span within the block."""
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for idx in range(actions_start + 1, actions_end):
+        if lines[idx].rstrip("\n\r").startswith(item_indent + "- "):
+            if start is not None:
+                spans.append((start, idx))
+            start = idx
+    if start is not None:
+        spans.append((start, actions_end))
+    return spans
 
 
 def _find_block_key_line(

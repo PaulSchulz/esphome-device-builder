@@ -316,6 +316,14 @@ Parsing and writing live on the backend: the frontend exchanges structured `Auto
 | `automations/upsert` | `{configuration, automation, location, yaml?}` | `{yaml_diff: YamlDiff}` | Insert or replace one automation at `location`. Returns the splice the frontend applies in place. Optional `yaml` splices into the unsaved draft instead of disk. |
 | `automations/delete` | `{configuration, location, yaml?}` | `{yaml_diff: YamlDiff}` | Remove the automation at `location`. Optional `yaml` splices into the unsaved draft instead of disk. |
 
+### Editor
+
+Backed by [`controllers/editor.py`](../esphome_device_builder/controllers/editor.py).
+
+| Command | Args | Response | Description |
+|---------|------|----------|-------------|
+| `editor/migrate_config` | `{content}` | `{yaml_diff: YamlDiff \| null}` | Apply every known migration to `content` in one splice, bringing the config up to date: the api `services:` block key and `service:` item discriminators, registry-action node ids and body fields (`homeassistant.service` → `homeassistant.action`, `service:` → `action:`), and the ethernet `clk_mode` → `clk` conversion. Line edits only — formatting and comments preserved. `null` when nothing needed migrating. Editor-namespaced because the rule set is device-YAML-wide — future migrations join the same rules fold. The frontend gates its migrate nudge on a mirrored detection (`src/util/config-migrations.ts`), so new rules need both sides. |
+
 ### Config
 
 > Controller: [`ConfigController`](../esphome_device_builder/controllers/config/controller.py)

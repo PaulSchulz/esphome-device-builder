@@ -393,7 +393,14 @@ against legacy behaviour before assuming the simpler version suffices.
   finds a pair outside `_HANDLED_RENAME_KEYS`, so a new upstream rename
   surfaces on the nightly sync instead of shipping unhandled. Current
   entries: the api `services`→`actions` / `service`→`action` pair
-  (#2396).
+  (#2396) and the homeassistant action's `service`→`action` field under
+  both registered ids. `editor/migrate_config`
+  (`controllers/migrations.py`, one rule function per migration) is the
+  migration-helper leg: a one-click whole-file update covering every
+  handled rename (plus the legacy `homeassistant.service` node id and
+  the ethernet `clk_mode`→`clk` conversion), driven by the frontend's
+  migrate nudge. New migrations add a rule function to the fold, not a
+  new command.
 - **The long-lived process never imports `esphome.components.*`.**
   Importing `esphome.components.esp32` drags in espidf → requests →
   `esphome.config` (~9s of cold start on an HA Green). Static platform
