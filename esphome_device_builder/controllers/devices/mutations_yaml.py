@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn
 
 from ...helpers.api import CommandError
@@ -134,6 +135,7 @@ async def validate_rewritten_yaml_or_raise(
     tolerate_unavailable: bool = False,
     timeout: float | None = None,
     packages_span: tuple[int, int] | None = None,
+    packages_root: Path | None = None,
     failure_tail: str | None = None,
 ) -> str | None:
     """
@@ -154,7 +156,9 @@ async def validate_rewritten_yaml_or_raise(
     *packages_span* (0-indexed line span of the ``packages:`` block):
     when every validation error roots inside it, the file is kept and a
     warning string is returned instead of raising. Returns ``None``
-    when *content* validates clean.
+    when *content* validates clean. *packages_root* is the package-cache
+    dir the containment check compares against; the caller resolves it
+    off-loop (``CORE.data_dir`` stats the disk).
 
     *failure_tail* overrides the ``INVALID_ARGS`` refusal's closing
     sentence.
@@ -192,13 +196,15 @@ async def validate_rewritten_yaml_or_raise(
             return None
         errors = [
             *(err.get("message", "") for err in result.get("yaml_errors", [])),
-            *(err.get("message", "") for err in result.get("validation_errors", [])),
+            *(_describe_validation_error(err) for err in result.get("validation_errors", [])),
         ]
         errors = [msg for msg in errors if msg]
         if not errors:
             succeeded = True
             return None
-        warning = _packages_confined_warning(result, packages_span, configuration, action)
+        warning = _packages_confined_warning(
+            result, packages_span, packages_root, configuration, action
+        )
         if warning is not None:
             succeeded = True
             return warning
@@ -260,15 +266,16 @@ def packages_block_span(content: str) -> tuple[int, int] | None:
 def _packages_confined_warning(
     result: dict,
     packages_span: tuple[int, int] | None,
+    packages_root: Path | None,
     configuration: str,
     action: str,
 ) -> str | None:
     """Warning when every validation error is attributable to the packages block, else ``None``."""
-    if packages_span is None or result.get("yaml_errors"):
+    if packages_span is None or packages_root is None or result.get("yaml_errors"):
         return None
     entries = result.get("validation_errors", [])
     if not entries or not all(
-        _entry_confined_to_packages(entry, packages_span) for entry in entries
+        _entry_confined_to_packages(entry, packages_span, packages_root) for entry in entries
     ):
         return None
     _LOGGER.info(
@@ -277,8 +284,9 @@ def _packages_confined_warning(
         action,
     )
     body = _summarise([str(entry.get("message", "")) for entry in entries])
+    verb = "Created" if action == "create" else "Imported"
     return (
-        f"Imported, but the remote package didn't validate: {body}. "
+        f"{verb}, but the remote package didn't validate: {body}. "
         "Fix the packages entry in the editor; install will surface "
         "the same error until it resolves."
     )
@@ -294,21 +302,30 @@ def _summarise(errors: list[str]) -> str:
     return ("; ".join(shown) + suffix).removesuffix(".")
 
 
-def _entry_confined_to_packages(entry: dict, packages_span: tuple[int, int]) -> bool:
+def _entry_confined_to_packages(
+    entry: dict, packages_span: tuple[int, int], packages_root: Path
+) -> bool:
     """
     Report whether a validation error is attributable to the packages block.
 
-    The validator marks the edited file ``<file>``; an error in any
-    other document (fetched package content, or an ``!include``) is
-    treated as confined. Callers gate *packages_span* to generated
-    adoption YAML, which carries no ``!include``; a defined-but-invalid
-    ``!secret`` value may also stamp secrets.yaml and ride the
-    exemption.
+    The validator marks the edited file ``<file>``; any other document
+    is confined only when it lives in esphome's package cache, so an
+    ``!include`` or secrets.yaml error fails closed.
     """
     range_ = entry.get("range")
     if not range_:
         return False
-    if range_.get("document", "<file>") != "<file>":
-        return True
+    document = range_.get("document", "<file>")
+    if document != "<file>":
+        return Path(document).is_relative_to(packages_root)
     start, end = packages_span
     return bool(start <= range_.get("start_line", -1) < end)
+
+
+def _describe_validation_error(entry: dict) -> str:
+    """Return the validation message, naming the offending document when foreign."""
+    message = entry.get("message", "")
+    document = (entry.get("range") or {}).get("document", "<file>")
+    if message and document != "<file>":
+        return f"{message} ({Path(document).name})"
+    return str(message)

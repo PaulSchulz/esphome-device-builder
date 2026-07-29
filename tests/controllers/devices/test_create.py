@@ -885,6 +885,116 @@ async def test_create_device_package_board_writes_package_yaml(
     ctrl._db.editor.validate_yaml.assert_awaited_once()
 
 
+async def test_create_device_package_board_keeps_yaml_on_package_failure(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """An upstream failure confined to ``packages:`` creates with a warning, not INTERNAL_ERROR."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+    ctrl._db.boards.get_board = AsyncMock(return_value=_package_board())
+
+    async def _validate(
+        *, configuration: str, content: str, timeout: float | None = None
+    ) -> dict[str, Any]:
+        lines = content.splitlines()
+        packages_line = next(i for i, line in enumerate(lines) if line.startswith("packages:"))
+        return {
+            "yaml_errors": [],
+            "validation_errors": [
+                {
+                    "message": "olimex-esp32-poe-iso.yaml does not exist in repository",
+                    "range": {
+                        "document": "<file>",
+                        "start_line": packages_line + 1,
+                        "start_col": 2,
+                        "end_line": packages_line + 3,
+                        "end_col": 0,
+                    },
+                },
+            ],
+        }
+
+    ctrl._db.editor.validate_yaml = AsyncMock(side_effect=_validate)
+
+    result = await ctrl.create_device(name="proxy", board_id="olimex-esp32-poe-iso-bluetooth-proxy")
+
+    assert result.configuration == "proxy.yaml"
+    assert result.warning is not None
+    assert result.warning.startswith("Created, but")
+    assert "does not exist in repository" in result.warning
+    assert (tmp_path / "proxy.yaml").exists()
+
+
+async def test_create_device_package_board_keeps_yaml_on_package_cache_error(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """An error rooted in a package-cache document creates with a warning."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+    ctrl._db.boards.get_board = AsyncMock(return_value=_package_board())
+    cache_doc = str(ctrl._packages_root / "ab12cd34" / "olimex-esp32-poe-iso.yaml")
+    ctrl._db.editor.validate_yaml = AsyncMock(
+        return_value={
+            "yaml_errors": [],
+            "validation_errors": [
+                {
+                    "message": "[sensor] required key not provided",
+                    "range": {
+                        "document": cache_doc,
+                        "start_line": 12,
+                        "start_col": 0,
+                        "end_line": 12,
+                        "end_col": 4,
+                    },
+                },
+            ],
+        }
+    )
+
+    result = await ctrl.create_device(name="proxy", board_id="olimex-esp32-poe-iso-bluetooth-proxy")
+
+    assert result.configuration == "proxy.yaml"
+    assert result.warning is not None
+    assert result.warning.startswith("Created, but")
+    assert (tmp_path / "proxy.yaml").exists()
+
+
+async def test_create_device_package_board_schema_error_keeps_generator_refusal(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """An error outside the ``packages:`` span still raises INTERNAL_ERROR and rolls back."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+    ctrl._db.boards.get_board = AsyncMock(return_value=_package_board())
+
+    async def _validate(
+        *, configuration: str, content: str, timeout: float | None = None
+    ) -> dict[str, Any]:
+        lines = content.splitlines()
+        esphome_line = next(i for i, line in enumerate(lines) if line.startswith("esphome:"))
+        return {
+            "yaml_errors": [],
+            "validation_errors": [
+                {
+                    "message": "[esphome] generator regression",
+                    "range": {
+                        "document": "<file>",
+                        "start_line": esphome_line,
+                        "start_col": 0,
+                        "end_line": esphome_line,
+                        "end_col": 7,
+                    },
+                },
+            ],
+        }
+
+    ctrl._db.editor.validate_yaml = AsyncMock(side_effect=_validate)
+
+    with pytest.raises(CommandError) as excinfo:
+        await ctrl.create_device(name="proxy", board_id="olimex-esp32-poe-iso-bluetooth-proxy")
+
+    assert excinfo.value.code == ErrorCode.INTERNAL_ERROR
+    assert "report" in excinfo.value.message.lower()
+    assert not (tmp_path / "proxy.yaml").exists()
+
+
 async def test_create_device_wifi_package_board_persists_secrets(
     tmp_path: Path, make_controller: MakeControllerFactory
 ) -> None:
