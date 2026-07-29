@@ -340,10 +340,209 @@ async def test_import_device_rejects_when_imported_yaml_does_not_validate(
 
     assert excinfo.value.code == ErrorCode.INVALID_ARGS
     assert "required key not provided: a platform" in excinfo.value.message
+    # The file was rolled back, so the copy must not point at an editor.
+    assert "editor" not in excinfo.value.message
     # YAML rolled back so a retry doesn't trip ``FileExistsError``.
     assert not (tmp_path / "kitchen.yaml").exists()
     # Scanner must NOT have been notified of the half-imported device.
     assert ctrl._scanner.calls == []
+
+
+def _package_entry_error(content: str, message: str) -> dict[str, Any]:
+    """Build a validation error rooted at the packages entry line."""
+    lines = content.splitlines()
+    packages_line = next(i for i, line in enumerate(lines) if line.startswith("packages:"))
+    return {
+        "message": message,
+        "range": {
+            "document": "<file>",
+            "start_line": packages_line + 1,
+            "start_col": 2,
+            "end_line": packages_line + 3,
+            "end_col": 0,
+        },
+    }
+
+
+async def test_import_device_keeps_yaml_when_only_the_package_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_controller: MakeControllerFactory,
+) -> None:
+    """Errors rooted inside the ``packages:`` block keep the file and return a warning."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True)
+    _seed_import_state(ctrl)
+
+    async def _validate(
+        *, configuration: str, content: str, timeout: float | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "yaml_errors": [],
+            "validation_errors": [
+                _package_entry_error(content, "gl-s10.yaml does not exist in repository"),
+            ],
+        }
+
+    ctrl._db.editor.validate_yaml = AsyncMock(side_effect=_validate)
+
+    result = await ctrl.import_device(
+        name="kitchen",
+        project_name="x",
+        package_import_url="github://x",
+    )
+
+    assert result["configuration"] == "kitchen.yaml"
+    assert "does not exist in repository" in result["warning"]
+    assert (tmp_path / "kitchen.yaml").exists()
+    assert ctrl._scanner.calls != []
+
+
+async def test_import_device_keeps_yaml_when_the_error_roots_in_the_package_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_controller: MakeControllerFactory,
+) -> None:
+    """A resolved package whose content fails validation still keeps the file.
+
+    The validator marks such errors with the package file's document,
+    not the in-memory ``<file>``, at whatever line the remote content
+    puts them.
+    """
+    ctrl = make_controller(tmp_path, with_state_monitor=True)
+    _seed_import_state(ctrl)
+    ctrl._db.editor.validate_yaml = AsyncMock(
+        return_value={
+            "yaml_errors": [],
+            "validation_errors": [
+                {
+                    "message": "[sensor] required key not provided",
+                    "range": {
+                        "document": "/cache/packages/gl-s10.yaml",
+                        "start_line": 41,
+                        "start_col": 0,
+                        "end_line": 41,
+                        "end_col": 10,
+                    },
+                },
+            ],
+        }
+    )
+
+    result = await ctrl.import_device(
+        name="kitchen",
+        project_name="x",
+        package_import_url="github://x",
+    )
+
+    assert "required key not provided" in result["warning"]
+    assert (tmp_path / "kitchen.yaml").exists()
+
+
+async def test_import_device_refuses_when_an_error_roots_outside_packages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_controller: MakeControllerFactory,
+) -> None:
+    """An error outside the ``packages:`` span keeps the conservative refusal."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True)
+    _seed_import_state(ctrl)
+
+    async def _validate(
+        *, configuration: str, content: str, timeout: float | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "yaml_errors": [],
+            "validation_errors": [
+                _package_entry_error(content, "gl-s10.yaml does not exist in repository"),
+                {
+                    "message": "[esphome] invalid key",
+                    "range": {"start_line": 0, "start_col": 0, "end_line": 0, "end_col": 0},
+                },
+            ],
+        }
+
+    ctrl._db.editor.validate_yaml = AsyncMock(side_effect=_validate)
+
+    with pytest.raises(CommandError) as excinfo:
+        await ctrl.import_device(
+            name="kitchen",
+            project_name="x",
+            package_import_url="github://x",
+        )
+
+    assert excinfo.value.code == ErrorCode.INVALID_ARGS
+    assert not (tmp_path / "kitchen.yaml").exists()
+
+
+async def test_import_device_full_config_never_gets_the_package_exemption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_controller: MakeControllerFactory,
+) -> None:
+    """A ``?full_config`` import refuses even for packages-rooted errors."""
+
+    def _write_with_packages(*args: Any, **_kw: Any) -> None:
+        args[0].write_text(
+            "packages:\n  base: github://acme/base.yaml\nesphome:\n  name: x\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr("esphome.components.dashboard_import.import_config", _write_with_packages)
+    ctrl = make_controller(tmp_path, with_state_monitor=True)
+    _seed_import_state(ctrl)
+    ctrl._db.editor.validate_yaml = AsyncMock(
+        return_value={
+            "yaml_errors": [],
+            "validation_errors": [
+                {
+                    "message": "base.yaml does not exist in repository",
+                    "range": {
+                        "document": "<file>",
+                        "start_line": 1,
+                        "start_col": 2,
+                        "end_line": 2,
+                        "end_col": 0,
+                    },
+                },
+            ],
+        }
+    )
+
+    with pytest.raises(CommandError) as excinfo:
+        await ctrl.import_device(
+            name="kitchen",
+            project_name="x",
+            package_import_url="github://acme/full.yaml?full_config",
+        )
+
+    assert excinfo.value.code == ErrorCode.INVALID_ARGS
+    assert not (tmp_path / "kitchen.yaml").exists()
+
+
+async def test_import_device_refuses_when_an_error_has_no_range(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make_controller: MakeControllerFactory,
+) -> None:
+    """An error without a range can't be classified; fail closed."""
+    ctrl = make_controller(tmp_path, with_state_monitor=True)
+    _seed_import_state(ctrl)
+    ctrl._db.editor.validate_yaml = AsyncMock(
+        return_value={
+            "yaml_errors": [],
+            "validation_errors": [{"message": "gl-s10.yaml does not exist in repository"}],
+        }
+    )
+
+    with pytest.raises(CommandError) as excinfo:
+        await ctrl.import_device(
+            name="kitchen",
+            project_name="x",
+            package_import_url="github://x",
+        )
+
+    assert excinfo.value.code == ErrorCode.INVALID_ARGS
+    assert not (tmp_path / "kitchen.yaml").exists()
 
 
 async def test_import_device_validation_message_collapses_the_period(
@@ -370,7 +569,7 @@ async def test_import_device_validation_message_collapses_the_period(
             package_import_url="github://x",
         )
 
-    assert "repository. Fix the errors" in excinfo.value.message
+    assert "repository. The import was rolled back" in excinfo.value.message
     assert ".." not in excinfo.value.message
 
 
