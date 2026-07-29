@@ -935,6 +935,34 @@ def test_resolve_component_target_maps_subentity_to_platform_type() -> None:
     assert container.is_sub_entity is False
 
 
+def test_component_target_carries_catalog_id() -> None:
+    """The walk stamps the instance's catalog id; a sub-entity carries its parent's."""
+    text = (
+        "sun:\n  id: helios\n"
+        "sensor:\n"
+        "  - platform: aht10\n"
+        "    id: aht20\n"
+        "    temperature:\n      id: aht20_temperature\n"
+    )
+    for comp_id, expected in [
+        ("helios", "sun"),
+        ("aht20", "sensor.aht10"),
+        ("aht20_temperature", "sensor.aht10"),
+    ]:
+        target = resolve_component_target(text, comp_id)
+        assert target is not None
+        assert target.catalog_id == expected
+
+
+def test_iter_subentities_derives_cat_id_when_absent() -> None:
+    """A caller omitting ``cat_id`` gets it derived from the instance."""
+    instance = {"platform": "aht10", "id": "aht20", "temperature": {"id": "t"}}
+    subs = list(parsing.iter_subentities("sensor", instance, "aht20"))
+    assert [(domain, sub_id, key) for domain, _sub, sub_id, key in subs] == [
+        ("sensor", "t", "temperature")
+    ]
+
+
 def test_parse_recognises_hand_authored_subentity_handler() -> None:
     """An ``on_value_range`` on a sub-sensor parses to its sub-entity location."""
     text = (
@@ -1058,3 +1086,12 @@ def test_resolve_action_field_target_handles_sub_entity_and_bad_yaml() -> None:
     )
     assert parsing.resolve_action_field_target("{unclosed", "lawn") is None
     assert parsing.resolve_action_field_target(yaml, "nope") is None
+    # A platform instance is the shape where the two tuple elements differ.
+    text = (
+        "sensor:\n  - platform: aht10\n    id: aht20\n"
+        "    temperature:\n      id: aht20_temperature\n"
+    )
+    assert parsing.resolve_action_field_target(text, "aht20_temperature") == (
+        "sensor",
+        "sensor.aht10",
+    )
