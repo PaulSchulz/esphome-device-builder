@@ -1242,3 +1242,28 @@ def catalog_releases_ahead(stamp_file: str = "components.index.json") -> int:
     payload = json.loads((index / stamp_file).read_bytes())
     stamp = payload.get("esphome_schema_version") or payload["esphome_version"]
     return release_ordinal(stamp) - release_ordinal(esphome_version)
+
+
+_SPRINKLER_FIELD_PATHS = (
+    ("multiplier_number", "set_action"),
+    ("repeat_number", "set_action"),
+    ("valves", "run_duration_number", "set_action"),
+)
+
+
+@pytest.fixture
+def _sprinkler_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Seed the automations catalog path index with sprinkler's nested trigger fields."""
+    from esphome_device_builder.controllers.automations import parsing  # noqa: PLC0415
+
+    monkeypatch.setitem(parsing._ACTION_FIELD_PATH_INDEX, "sprinkler", _SPRINKLER_FIELD_PATHS)
+
+
+def apply_yaml_diff(text: str, from_line: int, to_line: int, replacement: str) -> str:
+    """Apply a YamlDiff splice exactly as the frontend ``applyYamlDiff`` does."""
+    lines = text.split("\n")
+    start = from_line - 1
+    delete = max(0, to_line - from_line + 1)
+    stripped = replacement.removesuffix("\n")
+    rep_lines = [] if stripped == "" else stripped.split("\n")
+    return "\n".join([*lines[:start], *rep_lines, *lines[start + delete :]])

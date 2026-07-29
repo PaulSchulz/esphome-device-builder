@@ -7,7 +7,16 @@ import re
 
 def key_header_re(key: str, *, indent: str = "") -> re.Pattern[str]:
     """Pattern matching a ``<key>:`` header line at exactly *indent*, bare or with a comment."""
-    return re.compile(rf"^{re.escape(indent)}{re.escape(key)}:\s*(?:#.*)?$")
+    return key_line_res(key, prefix=f"^{re.escape(indent)}")[0]
+
+
+def key_line_res(key: str, *, prefix: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """``(block header, inline scalar)`` patterns for ``<key>:`` after regex *prefix*."""
+    escaped = re.escape(key)
+    return (
+        re.compile(rf"{prefix}{escaped}:\s*(?:#.*)?$"),
+        re.compile(rf"{prefix}{escaped}:\s*[^\s#]"),
+    )
 
 
 def find_block_header(lines: list[str], key: str) -> int | None:
@@ -40,7 +49,9 @@ def top_list_item_starts(lines: list[str], start: int, end: int) -> list[int]:
     for idx in range(start + 1, end):
         raw = lines[idx].rstrip("\n\r")
         stripped = raw.lstrip(" ")
-        if not stripped.startswith("- "):
+        # A bare dash opens an item whose mapping starts on the next
+        # line (the shape the nested-delete prune writes).
+        if not stripped.startswith("- ") and stripped.rstrip(" ") != "-":
             continue
         prefix = raw[: len(raw) - len(stripped)]
         if item_indent is None:
