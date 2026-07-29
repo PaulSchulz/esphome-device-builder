@@ -292,20 +292,23 @@ def _upsert_subentity_on(
     """Splice an ``on_*:`` handler under a nested sub-entity (``aht20_temperature``)."""
     ref = _subentity_context(target)
     trigger = _require_trigger(target.domain, location)
-    if location.index is not None:
-        return upsert_subentity_on_entry(
-            yaml_text,
-            ref,
-            tree=tree,
-            component_id=location.component_id,
-            trigger_key=location.trigger,
-            trigger=trigger,
-            index=location.index,
+    try:
+        if location.index is not None:
+            return upsert_subentity_on_entry(
+                yaml_text,
+                ref,
+                tree=tree,
+                component_id=location.component_id,
+                trigger_key=location.trigger,
+                trigger=trigger,
+                index=location.index,
+            )
+        rendered = render_trigger_handler(tree, key=location.trigger)
+        res = upsert_subentity_handler(
+            yaml_text, ref, handler_key=location.trigger, rendered_yaml=rendered
         )
-    rendered = render_trigger_handler(tree, key=location.trigger)
-    res = upsert_subentity_handler(
-        yaml_text, ref, handler_key=location.trigger, rendered_yaml=rendered
-    )
+    except YamlUpsertNotSupportedError as err:
+        raise CommandError(ErrorCode.INVALID_ARGS, str(err)) from err
     if res is None:
         msg = (
             f"Sub-entity id={location.component_id!r} not found under "
@@ -730,15 +733,18 @@ def _delete_subentity_on(
 ) -> tuple[str, YamlDiff]:
     """Drop an ``on_*:`` handler from a nested sub-entity (``aht20_temperature``)."""
     ref = _subentity_context(target)
-    if location.index is not None:
-        return delete_subentity_list_entry(
-            yaml_text,
-            ref,
-            component_id=location.component_id,
-            handler_key=location.trigger,
-            index=location.index,
-        )
-    res = remove_subentity_handler(yaml_text, ref, handler_key=location.trigger)
+    try:
+        if location.index is not None:
+            return delete_subentity_list_entry(
+                yaml_text,
+                ref,
+                component_id=location.component_id,
+                handler_key=location.trigger,
+                index=location.index,
+            )
+        res = remove_subentity_handler(yaml_text, ref, handler_key=location.trigger)
+    except YamlUpsertNotSupportedError as err:
+        raise CommandError(ErrorCode.INVALID_ARGS, str(err)) from err
     if res is None:
         msg = (
             f"Sub-entity id={location.component_id!r} not found under "
