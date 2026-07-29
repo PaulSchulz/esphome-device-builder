@@ -75,6 +75,7 @@ _AUTOMATIONS_INDEX_FILE = _DEFINITIONS_DIR / "automations.index.json"
 _AUTOMATIONS_BODIES_DIR = _DEFINITIONS_DIR / "automations"
 _PIN_REGISTRY_MODES_INDEX_FILE = _DEFINITIONS_DIR / "pin_registry_modes.index.json"
 _PLATFORM_CAPABILITIES_INDEX_FILE = _DEFINITIONS_DIR / "platform_capabilities.index.json"
+_MIGRATION_RULES_INDEX_FILE = _DEFINITIONS_DIR / "migration_rules.index.json"
 _CACHE_ROOT = _REPO_ROOT / ".cache"
 
 # Fields stripped from index entries — they belong on the per-id body
@@ -1054,6 +1055,13 @@ def main() -> int:
 
         _emit_platform_capabilities_index()
         _LOGGER.info("Wrote platform capabilities -> %s", _PLATFORM_CAPABILITIES_INDEX_FILE)
+
+        _emit_migration_rules_index()
+        _LOGGER.info(
+            "Wrote migration rules: %d rules -> %s",
+            len(_MIGRATION_RULES),
+            _MIGRATION_RULES_INDEX_FILE,
+        )
     return 0
 
 
@@ -3645,6 +3653,30 @@ def _emit_pin_registry_modes_index(registry_modes: dict[str, list[str]]) -> None
     next_path.replace(_PIN_REGISTRY_MODES_INDEX_FILE)
 
 
+def _emit_migration_rules_index() -> None:
+    """Write the sync-discovered generic rename rules for ``editor/migrate_config``.
+
+    Always written — empty is the steady state. Atomic temp-then-replace.
+    """
+    rules = []
+    for kind, component, domain, platform, old, new in sorted(_MIGRATION_RULES):
+        record = {"kind": kind, "old": old, "new": new}
+        if kind == "component_block_field":
+            record["component"] = component
+        else:
+            record["domain"] = domain
+            record["platform"] = platform
+        rules.append(record)
+    next_path = _MIGRATION_RULES_INDEX_FILE.with_suffix(".json.next")
+    next_path.write_bytes(
+        orjson.dumps(
+            {"rules": rules},
+            option=orjson.OPT_SORT_KEYS | orjson.OPT_INDENT_2 | orjson.OPT_APPEND_NEWLINE,
+        )
+    )
+    next_path.replace(_MIGRATION_RULES_INDEX_FILE)
+
+
 def _emit_platform_capabilities_index() -> None:
     """Write the static esphome platform metadata the dashboard reads at runtime.
 
@@ -4846,11 +4878,17 @@ def introspect_component(component_id: str) -> dict[str, Any]:
     platform_manifests_by_domain = _enumerate_platform_manifests_by_domain(loader, component_id)
     platform_manifests = [pm for _domain, pm in platform_manifests_by_domain]
 
-    rename_pairs = dict(_collect_rename_keys(manifest))
-    for platform_manifest in platform_manifests:
-        for old_key, new_key in _collect_rename_keys(platform_manifest).items():
-            rename_pairs.setdefault(old_key, new_key)
-    _note_unhandled_rename_keys(component_id, rename_pairs)
+    manifest_multi_conf = bool(getattr(manifest, "multi_conf", False))
+    # Platform-domain blocks (sensor:, ota:, …) are - platform: lists,
+    # the same shape multi_conf makes of a component block.
+    list_form = (
+        manifest_multi_conf
+        or bool(getattr(manifest, "is_platform_component", False))
+        or component_id in _LIST_SCHEMA_MULTI_CONF
+    )
+    _classify_rename_pairs(component_id, _collect_rename_keys(manifest), list_form=list_form)
+    for domain, platform_manifest in platform_manifests_by_domain:
+        _classify_rename_pairs(component_id, _collect_rename_keys(platform_manifest), domain=domain)
 
     auto_load: list[str] = _resolve_auto_load(manifest.auto_load)
 
@@ -4889,7 +4927,7 @@ def introspect_component(component_id: str) -> dict[str, Any]:
     )
 
     return {
-        "multi_conf": bool(getattr(manifest, "multi_conf", False)),
+        "multi_conf": manifest_multi_conf,
         "is_target_platform": bool(getattr(manifest, "is_target_platform", False)),
         "platform_defaults": _collect_platform_defaults(manifest),
         "platform_constraints": platform_constraints,
@@ -8146,13 +8184,15 @@ _RENAME_SCHEMA_TYPES = (dict, vol.Schema)
 #: id from being reused. Entries sharing a stem re-introspect the same
 #: manifest, so the walk would otherwise repeat thousands of times per
 #: sync.
-_RENAME_KEYS_MEMO: dict[int, tuple[Any, dict[str, str]]] = {}
+_RENAME_KEYS_MEMO: dict[int, tuple[Any, dict[tuple[str, str], bool]]] = {}
 
-#: ``(component, old, new)`` rename pairs the dashboard handles:
-#: hard-coded read support, canonical respell on write, and a migration
-#: helper where the key is a form field. The sync fails when
-#: introspection finds a pair outside this list, so a new upstream
-#: ``cv.rename_key`` can't ship silently unhandled.
+#: ``(component, old, new)`` rename pairs the dashboard handles with
+#: bespoke code — anchors the generic migration machinery can't
+#: express (the api block/item respell; registry-node renames that
+#: need the id alias). Direct pairs on a component or platform schema
+#: ship data-driven through the migration-rules artifact instead. The
+#: sync fails when introspection finds a pair that is neither, so a
+#: new upstream ``cv.rename_key`` can't ship silently unhandled.
 _HANDLED_RENAME_KEYS = {
     ("api", "services", "actions"),
     ("api", "service", "action"),
@@ -8165,15 +8205,48 @@ _HANDLED_RENAME_KEYS = {
 
 _UNHANDLED_RENAME_KEYS: set[tuple[str, str, str]] = set()
 
+#: ``(kind, component, domain, platform, old, new)`` rows bound for the
+#: migration-rules artifact.
+_MIGRATION_RULES: set[tuple[str, str, str, str, str, str]] = set()
+
 #: Manifests the rename sweep actually walked; zero at check time means
 #: introspection's best-effort early returns silenced the canary.
 _RENAME_SWEEP_COUNT = [0]
 
 
-def _note_unhandled_rename_keys(component_id: str, pairs: Mapping[str, str]) -> None:
+def _note_unhandled_rename_keys(component_id: str, pairs: Iterable[tuple[str, str]]) -> None:
     """Record every discovered rename pair missing from the handled list."""
-    for old, new in pairs.items():
+    for old, new in pairs:
         if (component_id, old, new) not in _HANDLED_RENAME_KEYS:
+            _UNHANDLED_RENAME_KEYS.add((component_id, old, new))
+
+
+def _classify_rename_pairs(
+    component_id: str,
+    pairs: Mapping[tuple[str, str], bool],
+    *,
+    domain: str | None = None,
+    list_form: bool = False,
+) -> None:
+    """
+    Route discovered pairs: expressible → migration-rules artifact, else canary.
+
+    A *direct* pair (the validator sits on the schema's own mapping, no
+    wrapper descent) is a plain child-key rename the generic migration
+    engine applies; anything else needs bespoke handling. *list_form*
+    marks a ``multi_conf`` component whose block is a list —
+    ``component_block_field`` can't address those, so its pairs fall to
+    the canary.
+    """
+    for (old, new), direct in pairs.items():
+        if (component_id, old, new) in _HANDLED_RENAME_KEYS:
+            continue
+        if direct and not list_form and old != new:
+            if domain is None:
+                _MIGRATION_RULES.add(("component_block_field", component_id, "", "", old, new))
+            else:
+                _MIGRATION_RULES.add(("platform_item_field", "", domain, component_id, old, new))
+        else:
             _UNHANDLED_RENAME_KEYS.add((component_id, old, new))
 
 
@@ -8201,12 +8274,14 @@ def _fail_on_unhandled_rename_keys() -> None:
     )
 
 
-def _collect_rename_keys(manifest: Any) -> dict[str, str]:
+def _collect_rename_keys(manifest: Any) -> dict[tuple[str, str], bool]:
     """
     Walk the live ``CONFIG_SCHEMA`` for ``cv.rename_key`` aliases.
 
-    Returns ``{old_key: new_key}`` for every rename validator reachable
-    from the schema, including list-item and wrapper-closure schemas.
+    Returns ``{(old_key, new_key): direct}`` for every rename validator
+    reachable from the schema, including list-item and wrapper-closure
+    schemas; *direct* means it sits on the schema's own mapping (only a
+    ``cv.All`` / ``.extend`` validator chain between it and the root).
     Empty dict when the component has no schema. Memoised per schema —
     callers must not mutate the result.
     """
@@ -8232,28 +8307,37 @@ def _sweep_registry_rename_keys() -> None:
             _note_unhandled_rename_keys(registry_id, pairs)
 
 
-def _schema_rename_keys(schema: Any) -> dict[str, str]:
+def _schema_rename_keys(schema: Any) -> dict[tuple[str, str], bool]:
     """Walk *schema* for rename validators; memoised, don't mutate the result."""
     memoised = _RENAME_KEYS_MEMO.get(id(schema))
     if memoised is not None:
         return memoised[1]
-    out: dict[str, str] = {}
+    out: dict[tuple[str, str], bool] = {}
     visited: set[int] = set()
     capped = False
-    stack: list[tuple[Any, int]] = [(schema, 0)]
+    stack: list[tuple[Any, int, bool]] = [(schema, 0, True)]
     while stack:
-        node, depth = stack.pop()
-        if node is None or id(node) in visited:
+        node, depth, direct = stack.pop()
+        if node is None:
             continue
         if depth > 10:
             capped = True
             continue
-        visited.add(id(node))
         pair = _rename_key_pair(node)
         if pair is not None:
-            out.setdefault(pair[0], pair[1])
+            # ``and`` so a pair also reachable nested stays inexpressible
+            # (fail-loud): the generic rule would cover only the direct
+            # occurrence. Rename validators bypass the visited gate so a
+            # shared closure lets every path vote.
+            out[pair] = out.get(pair, True) and direct
             continue
-        stack.extend((child, depth + 1) for child in _rename_walk_children(node))
+        if id(node) in visited:
+            continue
+        visited.add(id(node))
+        stack.extend(
+            (child, depth + 1, direct and stays_direct)
+            for child, stays_direct in _rename_walk_children(node)
+        )
     if capped:
         _LOGGER.warning("rename_key walk hit the depth cap; coverage may be incomplete")
     _RENAME_SWEEP_COUNT[0] += 1
@@ -8285,14 +8369,20 @@ def _is_rename_wrapper(node: Any) -> bool:
     return isinstance(node, FunctionType) and node.__qualname__.startswith(_RENAME_WRAPPER_PREFIXES)
 
 
-def _rename_walk_children(node: Any) -> Iterator[Any]:
-    """Yield the children of *node* worth visiting when hunting rename validators."""
+def _rename_walk_children(node: Any) -> Iterator[tuple[Any, bool]]:
+    """Yield ``(child, stays_direct)`` pairs worth visiting when hunting rename validators.
+
+    Only a validator-chain step (``cv.All`` / ``.extend``) keeps a child
+    direct; mapping values and wrapper closures are nested schemas.
+    """
     validators = getattr(node, "validators", None)
     if isinstance(validators, (list, tuple)):
-        yield from validators
+        for child in validators:
+            yield child, True
     schema = node if isinstance(node, dict) else getattr(node, "schema", None)
     if isinstance(schema, dict):
-        yield from schema.values()
+        for value in schema.values():
+            yield value, False
     if not _is_rename_wrapper(node):
         return
     try:
@@ -8305,7 +8395,7 @@ def _rename_walk_children(node: Any) -> Iterator[Any]:
             or isinstance(getattr(value, "validators", None), (list, tuple))
             or _is_rename_wrapper(value)
         ):
-            yield value
+            yield value, False
 
 
 def _collect_registry_members(manifest: Any) -> dict[str, bool]:
