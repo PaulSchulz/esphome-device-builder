@@ -134,10 +134,19 @@ def _apply_action_node_rename(
     return out
 
 
+# Shapes the generic rules deliberately don't reach — check when the
+# first real pair lands: flow-style list items, and the legacy
+# bare-mapping ``ota:`` / ``time:`` form (implicit platform).
 def _apply_generated_renames(lines: list[str]) -> list[str]:
     """Apply the sync-discovered rename rules from the generated artifact."""
     out = lines
-    for rule in load_migration_rules_index():
+    rules = load_migration_rules_index()
+    # Key respells first, so a same-release field rename inside the
+    # renamed block still converges in this single fold pass.
+    for rule in rules:
+        if rule.kind == "component_key":
+            out = _respell_top_level_key(out, rule.old, rule.new)
+    for rule in rules:
         # No fallthrough: a kind this build doesn't know is a no-op,
         # never misapplied as some other kind's rename.
         if rule.kind == "component_block_field":
@@ -261,19 +270,6 @@ def _child_block_span(
             continue
         return idx, child_block_end(lines, idx, min(end, len(lines)), child_indent)
     return None
-
-
-# Deprecated top-level platform block keys and their canonical spellings
-# (esphome component ALIASES, invisible to the cv.rename_key sync canary).
-# rp2040 -> rp2: renamed in esphome 2026.7, alias removed in 2027.7.
-_PLATFORM_KEY_RENAMES = (("rp2040", "rp2"),)
-
-
-def _migrate_platform_keys(lines: list[str]) -> list[str]:
-    """Respell deprecated top-level platform block keys to their canonical names."""
-    for legacy, canonical in _PLATFORM_KEY_RENAMES:
-        lines = _respell_top_level_key(lines, legacy, canonical)
-    return lines
 
 
 def _respell_top_level_key(lines: list[str], legacy: str, canonical: str) -> list[str]:
@@ -453,6 +449,5 @@ _RULES = (
     _canonicalize_api_actions,
     _canonicalize_action_nodes,
     _migrate_ethernet_clk,
-    _migrate_platform_keys,
     _apply_generated_renames,
 )
