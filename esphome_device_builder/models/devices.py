@@ -149,6 +149,8 @@ class Device(DashboardModel):
     update_available: bool = False  # True if compiled with older ESPHome version
     uses_mqtt: bool = False  # True if the YAML declares a top-level mqtt: block
     uses_deep_sleep: bool = False  # True if the YAML declares a top-level deep_sleep: block
+    # Truthy esphome.name_add_mac_suffix; status tracking is unavailable for such configs.
+    name_add_mac_suffix: bool = False
     # Native API surface flags — drive the lock-icon indicator in
     # the device list. Both fields are computed in
     # ``helpers.device_yaml.load_device_from_storage`` as the

@@ -41,11 +41,13 @@ from esphome_device_builder.helpers.device_yaml import (
 )
 from esphome_device_builder.helpers.device_yaml._parsing import (
     _is_valid_esphome_name,
+    config_name_add_mac_suffix,
     device_ap_label,
     extract_logger_baud_rate,
     extract_logger_interface,
     extract_ota_partition_access,
     resolve_esp32_variant,
+    yaml_has_name_add_mac_suffix,
 )
 from esphome_device_builder.models import (
     BoardCatalogEntry,
@@ -1117,6 +1119,84 @@ def test_load_device_from_storage_detects_deep_sleep(tmp_path: Path) -> None:
     awake = tmp_path / "awake.yaml"
     awake.write_text("esphome:\n  name: awake\napi:\n", encoding="utf-8")
     assert load_device_from_storage(awake).uses_deep_sleep is False
+
+
+def test_load_device_from_storage_detects_name_add_mac_suffix(tmp_path: Path) -> None:
+    """A truthy ``esphome.name_add_mac_suffix`` sets the flag; false or absent clears it."""
+    suffixed = tmp_path / "suffixed.yaml"
+    suffixed.write_text("esphome:\n  name: kit\n  name_add_mac_suffix: true\n", encoding="utf-8")
+    assert load_device_from_storage(suffixed).name_add_mac_suffix is True
+
+    adopted = tmp_path / "adopted.yaml"
+    adopted.write_text(
+        "esphome:\n  name: kit-aabbcc\n  name_add_mac_suffix: false\n", encoding="utf-8"
+    )
+    assert load_device_from_storage(adopted).name_add_mac_suffix is False
+
+    plain = tmp_path / "plain.yaml"
+    plain.write_text("esphome:\n  name: plain\n", encoding="utf-8")
+    assert load_device_from_storage(plain).name_add_mac_suffix is False
+
+    quoted = tmp_path / "quoted.yaml"
+    quoted.write_text('esphome:\n  name: kit\n  name_add_mac_suffix: "enable"\n', encoding="utf-8")
+    assert load_device_from_storage(quoted).name_add_mac_suffix is True
+
+
+def test_load_device_name_add_mac_suffix_survives_invalid_draft(tmp_path: Path) -> None:
+    """The raw-text fallback keeps the flag set when the draft doesn't parse."""
+    draft = tmp_path / "draft.yaml"
+    draft.write_text(
+        "esphome:\n  name: kit\n  name_add_mac_suffix: yes\nwifi: [broken\n", encoding="utf-8"
+    )
+    assert load_device_from_storage(draft).name_add_mac_suffix is True
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        pytest.param("esphome:\n  name: a\n  name_add_mac_suffix: true\n", True, id="true"),
+        pytest.param("esphome:\n  name: a\n  name_add_mac_suffix: On\n", True, id="on"),
+        pytest.param("esphome:\n\n  name_add_mac_suffix: yes\n", True, id="blank_line"),
+        pytest.param("esphome:\n  name_add_mac_suffix: false\n", False, id="false"),
+        pytest.param(
+            "esphome:\n  name: a\nweb_server:\n  name_add_mac_suffix: true\n",
+            False,
+            id="other_block",
+        ),
+        pytest.param("esphome:\n  name: a\n", False, id="absent"),
+        pytest.param("esphome:\n  name_add_mac_suffix: enabled\n", False, id="enabled_not_truthy"),
+        pytest.param("esphome:\n  name_add_mac_suffix: 1\n", False, id="numeric_not_truthy"),
+        pytest.param('esphome:\n  name_add_mac_suffix: "true"\n', True, id="quoted_value"),
+        pytest.param("esphome:\n  Name_Add_Mac_Suffix: true\n", False, id="cased_key"),
+        pytest.param(
+            "esphome:\n  name: a\n# note\n  name_add_mac_suffix: true\n",
+            True,
+            id="column0_comment",
+        ),
+    ],
+)
+def test_yaml_has_name_add_mac_suffix(content: str, expected: bool) -> None:
+    """The raw scan matches truthy values under ``esphome:`` only."""
+    assert yaml_has_name_add_mac_suffix(content) is expected
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        pytest.param(None, False, id="no_config"),
+        pytest.param({"esphome": "kit"}, False, id="block_not_dict"),
+        pytest.param({"esphome": {"name_add_mac_suffix": True}}, True, id="bool_true"),
+        pytest.param({"esphome": {"name_add_mac_suffix": False}}, False, id="bool_false"),
+        pytest.param({"esphome": {"name_add_mac_suffix": "enable"}}, True, id="str_enable"),
+        pytest.param({"esphome": {"name_add_mac_suffix": "disable"}}, False, id="str_disable"),
+        pytest.param({"esphome": {"name_add_mac_suffix": 1}}, False, id="non_bool_scalar"),
+        pytest.param({"esphome": {"name_add_mac_suffix": "enabled"}}, False, id="str_enabled"),
+        pytest.param({"esphome": {}}, False, id="absent"),
+    ],
+)
+def test_config_name_add_mac_suffix(config: dict | None, expected: bool) -> None:
+    """Resolved-config detection accepts bools and ``cv.boolean`` truthy strings."""
+    assert config_name_add_mac_suffix(config) is expected
 
 
 @pytest.mark.parametrize(
