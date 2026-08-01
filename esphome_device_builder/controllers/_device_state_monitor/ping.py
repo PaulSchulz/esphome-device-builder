@@ -10,6 +10,7 @@ from icmplib import async_ping as icmp_ping
 from icmplib.exceptions import ICMPLibError
 
 from ...helpers.hostname import is_local_hostname
+from ...helpers.ip import drop_unusable_addresses
 from ...models import Device, DeviceState
 from . import shared
 from ._sweep_source import SweepSource
@@ -227,14 +228,23 @@ class PingSource(SweepSource):
         # keep the two chains in lockstep.
         monitor = self._monitor
         async with self.icmp_concurrency:
-            addresses = await monitor.state.dns_cache.async_resolve(device.address)
+            # Filter the resolve, not the merged chain: a literal
+            # loopback ``use_address`` rides the DNS cache's literal
+            # short-circuit past every apply-side filter, and pinging it
+            # would latch the device ONLINE off the dashboard host
+            # itself (#2486). The later sources arrive pre-filtered, so
+            # an all-unusable answer falls through to them instead of
+            # dead-ending.
+            addresses = drop_unusable_addresses(
+                await monitor.state.dns_cache.async_resolve(device.address) or []
+            )
             if not addresses and is_local_hostname(device.address):
                 # System resolver couldn't resolve the ``.local`` (no nss-mdns
                 # in most container images). Fall back to zeroconf's own mDNS
                 # cache, kept fresh by the ``AsyncServiceBrowser``, rather than
                 # giving up — but ping still decides liveness, so a stale or
                 # reflected entry demotes instead of latching ONLINE (#1776).
-                addresses = monitor.mdns.get_cached_addresses(device.address)
+                addresses = monitor.mdns.get_cached_addresses(device.address) or []
             if not addresses:
                 # mDNS-less devices: the ``.local`` won't resolve but a
                 # prior MQTT/DNS observation left a usable IP. Ping that so
