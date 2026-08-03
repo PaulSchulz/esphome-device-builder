@@ -23,6 +23,10 @@ clients**. The gates that enforce it are:
   enforced by the supervisor and by physically binding the
   ingress site to the supervisor's docker network. See
   ARCHITECTURE.md for the Music-Assistant-pattern rationale.
+  Supervisor-only endpoints (`POST /encryption-key`) gate on
+  `app["supervisor_channel"]`, set only when an app is created
+  both trusted and peer-guarded — i.e. the ingress site; every
+  other site shape refuses them.
 - The reverse-proxy `--trusted-domains` `Origin` / `Host`
   allowlist (defense against DNS rebinding and browser-driven
   cross-origin attacks).
