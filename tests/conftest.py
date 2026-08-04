@@ -52,6 +52,7 @@ from esphome_device_builder.controllers.remote_build import (
     OffloaderController,
     ReceiverController,
 )
+from esphome_device_builder.controllers.remote_build.discovery import start_discovery
 from esphome_device_builder.helpers.event_bus import Event, EventBus
 from esphome_device_builder.helpers.peer_link_identity import PeerLinkIdentityStore
 from esphome_device_builder.helpers.secrets_state import write_secrets_locked
@@ -347,6 +348,7 @@ class RemoteBuildTestHandles:
         """Start both siblings, in the same order ``DeviceBuilder`` does."""
         await self.receiver.start()
         await self.offloader.start()
+        start_discovery(self.offloader)
 
     async def stop(self) -> None:
         """Stop both siblings, in the same order ``DeviceBuilder`` does."""
@@ -894,6 +896,13 @@ def _hermetic_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
     # monkeypatch a leaked ``config_path`` poisons sibling tests in
     # the same xdist worker.
     monkeypatch.setattr(CORE, "config_path", None)
+
+
+async def release_and_drain_advertise(db: Any) -> None:
+    """Open the serving gate and await ``DeviceBuilder``'s chained advertise task."""
+    db.notify_serving()
+    assert db._advertise_task is not None
+    await asyncio.wait_for(db._advertise_task, timeout=5)
 
 
 # ---------------------------------------------------------------------------

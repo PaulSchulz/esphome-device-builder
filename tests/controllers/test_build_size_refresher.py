@@ -44,6 +44,7 @@ def _make(
     on_refreshed=None,
     metadata: dict[str, dict[str, Any]] | None = None,
     persist_size=None,
+    initial_sweep_delay: float = 0.0,
 ) -> tuple[BuildSizeRefresher, list[str], list[tuple[str, BuildSizeRefreshResult]]]:
     """Build a refresher + the lists its callbacks append to.
 
@@ -66,6 +67,7 @@ def _make(
         get_metadata_snapshot=lambda: snapshot,
         persist_size=persist_size or _default_persist,
         on_refreshed=on_refreshed or _default_callback,
+        initial_sweep_delay=initial_sweep_delay,
     )
     return refresher, refreshed, persisted
 
@@ -320,6 +322,34 @@ async def test_enqueue_stale_fleet_empty_filenames_skips_executor(tmp_path: Path
 
     assert calls == []  # short-circuited before scheduling anything
     assert refresher.pending == set()
+
+
+async def test_initial_sweep_delay_holds_sweep_but_drains_requests(
+    tmp_path: Path,
+) -> None:
+    """A configured delay parks only the fleet sweep; the drain loop is live from the start."""
+    refresher, refreshed, _ = _make(tmp_path, initial_sweep_delay=3600.0)
+    refresher.start()
+    await asyncio.sleep(0)
+    sweep = refresher._sweep_task
+    assert sweep is not None
+    assert not sweep.done()  # fleet walk held on the delay
+
+    with patch(
+        "esphome_device_builder.controllers._build_size_refresher.refresh_build_size_if_stale",
+        return_value=BuildSizeRefreshResult(
+            size_bytes=1, signal=BuildDirSignal(dir_mtime=1, info_mtime=1)
+        ),
+    ):
+        refresher.request("kitchen.yaml")
+        await asyncio.wait_for(refresher.wait_idle(), _TIMEOUT)
+
+    assert refreshed == ["kitchen.yaml"]  # drained while the sweep is still held
+    assert not sweep.done()
+
+    await refresher.stop()
+    assert refresher._task is None
+    assert refresher._sweep_task is None
 
 
 # ----------------------------------------------------------------------
