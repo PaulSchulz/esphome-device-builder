@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -13,10 +14,12 @@ from esphome.const import CONF_PACKAGES
 from esphome.core import EsphomeError
 from esphome.storage_json import StorageJSON
 
+from ...constants import SECRETS_FILENAME
 from ...models import Device, DeviceRuntimeState
 from ...models.boards import normalize_platform
 from ..mac_addresses import derive_interface_macs
 from ..storage_path import resolve_compiled_config_path, resolve_storage_path
+from ._mqtt_block import build_mqtt_extract
 from ._parsing import (
     _CONF_ALLOW_PARTITION_ACCESS,
     _extract_resolved_substitutions,
@@ -36,6 +39,7 @@ from ._parsing import (
     mdns_disabled_enabled,
     name_add_mac_suffix_enabled,
     parse_esphome_meta,
+    safe_stat_key,
     yaml_has_api_encryption,
     yaml_has_top_level_block,
 )
@@ -110,10 +114,8 @@ def load_device_from_storage(
     filename = path.name
     storage = StorageJSON.load(resolve_storage_path(filename))
 
-    try:
-        yaml_content = path.read_text(encoding="utf-8")
-    except OSError:
-        yaml_content = ""
+    yaml_stat, yaml_content, secrets_key = _snapshot_source_files(path)
+    yaml_mtime = yaml_stat.st_mtime if yaml_stat is not None else None
     # Full resolved config (``!include`` / packages / ``!secret``
     # expanded) drives the api-encryption flag — a bare regex on raw
     # YAML would miss configs that pull the api block in via include
@@ -167,7 +169,6 @@ def load_device_from_storage(
     storage_area = getattr(storage, "area", None) if storage else None
     area = _pick_meta(yaml_meta.area, cfg_meta.area, storage_area) or ""
 
-    yaml_mtime = path.stat().st_mtime if path.exists() else None
     bin_mtime: float | None = None
     if storage and storage.firmware_bin_path and storage.firmware_bin_path.exists():
         bin_mtime = storage.firmware_bin_path.stat().st_mtime
@@ -196,6 +197,13 @@ def load_device_from_storage(
 
     update_available = bool(
         runtime.deployed_version and runtime.deployed_version != const.__version__
+    )
+
+    uses_mqtt = has_top_level_block(resolved_config, yaml_content, "mqtt")
+    mqtt_extract = (
+        build_mqtt_extract(yaml_content, resolved_config, yaml_stat, secrets_key, extra_subs)
+        if uses_mqtt and yaml_stat is not None
+        else None
     )
 
     # ``Device.target_platform`` is the lowercase platform *key*
@@ -334,7 +342,8 @@ def load_device_from_storage(
         # wins, raw-text fills in mid-edit, and we don't have a
         # ``loaded_integrations`` entry that maps cleanly to "uses
         # mqtt for dashboard discovery" the way ``"api"`` does.
-        uses_mqtt=has_top_level_block(resolved_config, yaml_content, "mqtt"),
+        uses_mqtt=uses_mqtt,
+        mqtt_extract=mqtt_extract,
         uses_deep_sleep=has_top_level_block(resolved_config, yaml_content, "deep_sleep"),
         name_add_mac_suffix=name_add_mac_suffix_enabled(resolved_config, yaml_content),
         mdns_disabled=mdns_disabled_enabled(resolved_config, yaml_content),
@@ -360,6 +369,20 @@ def load_device_from_storage(
             or compiled_config_has_ota_partition_access(filename)
         ),
     )
+
+
+def _snapshot_source_files(path: Path) -> tuple[os.stat_result | None, str, tuple[int, int]]:
+    """Stat + read the YAML and stamp the secrets mtime before the esphome parse."""
+    yaml_stat: os.stat_result | None
+    try:
+        yaml_stat = path.stat()
+    except OSError:
+        yaml_stat = None
+    try:
+        yaml_content = path.read_text(encoding="utf-8")
+    except OSError:
+        yaml_content = ""
+    return yaml_stat, yaml_content, safe_stat_key(path.parent / SECRETS_FILENAME)
 
 
 def compute_has_pending_changes(
