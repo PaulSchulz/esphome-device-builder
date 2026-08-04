@@ -151,6 +151,18 @@ def test_migration_is_one_shot(tmp_path: Path, real_catalog: BoardCatalog) -> No
     assert "board_id_user_set" not in get_device_metadata(tmp_path, "apollo2.yaml")
 
 
+def test_already_migrated_boot_never_writes(tmp_path: Path, real_catalog: BoardCatalog) -> None:
+    """A boot after the migration leaves the sidecar untouched on disk."""
+    set_device_metadata(tmp_path, "apollo.yaml", board_id=_APOLLO)
+    assert _migrate_board_id_user_set_sync(tmp_path, real_catalog) == 1
+    sidecar = tmp_path / ".device-builder.json"
+    before = sidecar.stat().st_mtime_ns
+
+    assert _migrate_board_id_user_set_sync(tmp_path, real_catalog) == 0
+
+    assert sidecar.stat().st_mtime_ns == before
+
+
 async def test_migrate_then_resolve_matches_fleet_outcome(
     tmp_path: Path, real_catalog: BoardCatalog
 ) -> None:

@@ -193,7 +193,7 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
 
         self._scanner = DeviceScanner(
             config_dir=self._db.settings.config_dir,
-            get_metadata=self._resolve_device_metadata,
+            make_metadata_resolver=self._make_metadata_resolver,
             on_change=self._on_scan_change,
         )
         # Single-worker build-size refresher. Bulk operations
@@ -275,12 +275,15 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         """Initialise — load state, scan files, start mDNS + ping + MQTT discovery."""
         self._stopped = False
         self.state.esphome_cmd = _find_esphome_cmd()
-        # Seed the store (and migrate on first post-upgrade boot)
-        # before the scanner runs — resolver reads off it.
-        await self._metadata_store.async_load()
-        await self._pending_keys.async_load()
-        await self.migrate_board_id_user_set()
-        await run_in_executor(self._load_ignored_devices)
+        # Store seed + migrations + ignore-list are independent; all
+        # must land before the scanner (the resolver reads off them).
+        # TaskGroup so a failing leg cancels its siblings instead of
+        # orphaning them past the aborted start.
+        async with asyncio.TaskGroup() as group:
+            group.create_task(self._metadata_store.async_load())
+            group.create_task(self._pending_keys.async_load())
+            group.create_task(self.migrate_board_id_user_set())
+            group.create_task(run_in_executor(self._load_ignored_devices))
         await self._scanner.scan()
         self._scanner.start()
         _LOGGER.info("Devices controller started — %d devices loaded", len(self._scanner.devices))

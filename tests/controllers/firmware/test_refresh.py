@@ -54,6 +54,10 @@ from tests._storage_fixtures import write_storage_json
 from tests.conftest import make_device
 
 
+def _stub_metadata(_config_dir: object, _filename: object) -> DeviceFileMetadata:
+    return DeviceFileMetadata(board_id="", ip="")
+
+
 def _device(name: str = "kitchen", **overrides: Any) -> Device:
     overrides.setdefault("current_version", "2026.5.0")
     return make_device(name=name, **overrides)
@@ -72,7 +76,7 @@ async def test_reload_rereads_state_and_fires_reloaded(tmp_path: Path) -> None:
     changes: list[tuple[ScanChange, Device]] = []
     scanner = DeviceScanner(
         config_dir=tmp_path,
-        get_metadata=lambda _config_dir, _filename: DeviceFileMetadata(board_id="", ip=""),
+        make_metadata_resolver=lambda: _stub_metadata,
         on_change=lambda kind, device, _previous: changes.append((kind, device)),
     )
 
@@ -94,7 +98,7 @@ async def test_reload_unknown_filename_is_noop(tmp_path: Path) -> None:
     changes: list[tuple[ScanChange, Device]] = []
     scanner = DeviceScanner(
         config_dir=tmp_path,
-        get_metadata=lambda _config_dir, _filename: DeviceFileMetadata(board_id="", ip=""),
+        make_metadata_resolver=lambda: _stub_metadata,
         on_change=lambda kind, device, _previous: changes.append((kind, device)),
     )
 
@@ -752,7 +756,7 @@ def test_scanner_get_by_configuration(tmp_path: Path) -> None:
     """The indexed lookup returns the device for a tracked filename, else ``None``."""
     scanner = DeviceScanner(
         config_dir=tmp_path,
-        get_metadata=lambda _config_dir, _filename: DeviceFileMetadata(board_id="", ip=""),
+        make_metadata_resolver=lambda: _stub_metadata,
         on_change=lambda _kind, _device, _previous: None,
     )
     device = _device()
