@@ -79,6 +79,32 @@ def test_init_threads_state_monitor_callbacks_to_controller_methods(
 
 
 @contextmanager
+def _capture_monitor_and_mqtt(controller: DevicesController) -> Iterator[list[str]]:
+    """Stub the monitor and coordinator only, leaving the scanner real for refine tests."""
+    log: list[str] = []
+
+    async def _state_monitor_start() -> None:
+        log.append("state_monitor.start")
+
+    async def _state_monitor_stop() -> None:
+        log.append("state_monitor.stop")
+
+    async def _mqtt_reconcile(**_kw: object) -> None:
+        log.append("mqtt.reconcile")
+
+    async def _mqtt_stop() -> None:
+        log.append("mqtt.stop")
+
+    with (
+        patch.multiple(
+            controller._state_monitor, start=_state_monitor_start, stop=_state_monitor_stop
+        ),
+        patch.multiple(controller._mqtt_coordinator, reconcile=_mqtt_reconcile, stop=_mqtt_stop),
+    ):
+        yield log
+
+
+@contextmanager
 def _capture_inner_lifecycle(controller: DevicesController) -> Iterator[list[str]]:
     """Patch the real start/stop/scan methods with stubs that record into a flat log.
 
@@ -101,31 +127,13 @@ def _capture_inner_lifecycle(controller: DevicesController) -> Iterator[list[str
     ``attach_mock`` ordering plumbing — same shape as
     ``capture_enqueue_order`` for the firmware queue/bus pair.
     """
-    log: list[str] = []
+    with _capture_monitor_and_mqtt(controller) as log:
 
-    async def _scan() -> None:
-        log.append("scan")
+        async def _scan(shallow: bool = False) -> None:
+            log.append("scan_shallow" if shallow else "scan")
 
-    async def _state_monitor_start() -> None:
-        log.append("state_monitor.start")
-
-    async def _state_monitor_stop() -> None:
-        log.append("state_monitor.stop")
-
-    async def _mqtt_reconcile() -> None:
-        log.append("mqtt.reconcile")
-
-    async def _mqtt_stop() -> None:
-        log.append("mqtt.stop")
-
-    with (
-        patch.multiple(controller._scanner, scan=_scan),
-        patch.multiple(
-            controller._state_monitor, start=_state_monitor_start, stop=_state_monitor_stop
-        ),
-        patch.multiple(controller._mqtt_coordinator, reconcile=_mqtt_reconcile, stop=_mqtt_stop),
-    ):
-        yield log
+        with patch.multiple(controller._scanner, scan=_scan):
+            yield log
 
 
 async def test_start_runs_full_initialisation_chain(
@@ -169,11 +177,11 @@ async def test_start_runs_full_initialisation_chain(
 
     assert controller.state.esphome_cmd == ["python", "-m", "esphome"]
     assert controller.state.ignored_devices == {"already-ignored"}
-    # Fact-of-call AND ordering in one assertion: scan first (the
-    # state monitor's first sweep reads ``self._scanner.devices``
+    # Fact-of-call AND ordering in one assertion: shallow scan first
+    # (the state monitor's first sweep reads ``self._scanner.devices``
     # so a swap would have it iterate over an empty list at
     # cold-start), then state_monitor.start, then mqtt.reconcile.
-    assert log == ["scan", "state_monitor.start", "mqtt.reconcile"]
+    assert log == ["scan_shallow", "state_monitor.start", "mqtt.reconcile"]
     # JOB_COMPLETED listener registered via the real ``EventBus``-shaped stub.
     assert db.bus.listeners == [(EventType.JOB_COMPLETED, controller._on_firmware_job_completed)]
     assert controller._unsub_job_completed is not None
@@ -192,7 +200,7 @@ async def test_start_pre_scan_loads_complete_before_scan(
     log: list[str] = []
 
     def _async_recorder(name: str):
-        async def _run() -> None:
+        async def _run(*_a: object, **_kw: object) -> None:
             log.append(name)
 
         return _run
@@ -235,6 +243,93 @@ async def test_build_size_worker_starts_live_with_delayed_sweep(
         await controller.stop()
 
     assert controller._build_size._task is None
+
+
+async def test_start_refines_shallow_seed_then_reconciles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_db: MakeDbFactory
+) -> None:
+    """The refine task deep-reloads the seeded fleet and re-runs the MQTT reconcile."""
+    monkeypatch.setattr(
+        "esphome_device_builder.controllers.devices.controller._find_esphome_cmd",
+        list,
+    )
+    # ``logger.baud_rate`` is resolved-only: the shallow seed carries
+    # ``None``, so the refine's deep reload must change the row and
+    # push the update to clients.
+    (tmp_path / "kitchen.yaml").write_text(
+        "esphome:\n  name: kitchen\nlogger:\n  baud_rate: 9600\n", encoding="utf-8"
+    )
+    db = make_db(tmp_path)
+    controller = DevicesController(db)
+
+    with _capture_monitor_and_mqtt(controller) as log:
+        await controller.start()
+        assert controller._refine_task is not None
+        await controller._refine_task
+        # A non-mqtt fleet arms no nudge; the mqtt-gated conditions are
+        # pinned in test_branches_coverage.
+        assert controller._mqtt_reconcile_handle is None
+        await controller.stop()
+
+    assert log.count("mqtt.reconcile") == 1
+    fired = [event_type for event_type, _data in db.bus.fired]
+    assert EventType.DEVICE_ADDED in fired
+    assert EventType.DEVICE_UPDATED in fired
+    # The refine burst must never read as an edit: one git commit per
+    # device per restart otherwise.
+    assert EventType.DEVICE_YAML_UPDATED not in fired
+
+
+async def test_stop_cancels_refine_mid_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_db: MakeDbFactory
+) -> None:
+    """A shutdown during the refine drain cancels the task and skips the trailing reconcile."""
+    monkeypatch.setattr(
+        "esphome_device_builder.controllers.devices.controller._find_esphome_cmd",
+        list,
+    )
+    (tmp_path / "kitchen.yaml").write_text("esphome:\n  name: kitchen\n", encoding="utf-8")
+    db = make_db(tmp_path)
+    controller = DevicesController(db)
+
+    async def _parked_reload(_filename: str) -> bool:
+        await asyncio.Event().wait()
+        return True
+
+    with _capture_monitor_and_mqtt(controller) as log:
+        # Patched before start() so any refine-triggered drain is
+        # guaranteed to block in the parked reload.
+        monkeypatch.setattr(controller._scanner, "reload", _parked_reload)
+        await controller.start()
+        task = controller._refine_task
+        assert task is not None
+        await asyncio.sleep(0)
+        await controller.stop()
+
+    assert task.done()
+    assert controller._refine_task is None
+    assert log.count("mqtt.reconcile") == 1
+
+
+async def test_stop_stops_build_size_before_scanner(tmp_path: Path, make_db: MakeDbFactory) -> None:
+    """Build-size stops first: its drain's ``on_refreshed`` requests a scanner reload."""
+    controller = DevicesController(make_db(tmp_path))
+    log: list[str] = []
+
+    async def _build_size_stop() -> None:
+        log.append("build_size.stop")
+
+    async def _scanner_stop() -> None:
+        log.append("scanner.stop")
+
+    with (
+        _capture_monitor_and_mqtt(controller),
+        patch.multiple(controller._build_size, stop=_build_size_stop),
+        patch.multiple(controller._scanner, stop=_scanner_stop),
+    ):
+        await controller.stop()
+
+    assert log.index("build_size.stop") < log.index("scanner.stop")
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +410,84 @@ async def test_poll_is_noop_after_stop(tmp_path: Path, make_db: MakeDbFactory) -
         await controller.poll()
 
     assert log == []
+
+
+async def test_mqtt_nudge_debounce_coalesces_and_fires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_db: MakeDbFactory
+) -> None:
+    """Repeated nudges share one timer, and its firing runs a single reconcile."""
+    monkeypatch.setattr(
+        "esphome_device_builder.controllers.devices.controller._MQTT_RECONCILE_DEBOUNCE_SECONDS",
+        0.0,
+    )
+    controller = DevicesController(make_db(tmp_path))
+
+    with _capture_monitor_and_mqtt(controller) as log:
+        controller.schedule_mqtt_reconcile()
+        first = controller._mqtt_reconcile_handle
+        assert first is not None
+        controller.schedule_mqtt_reconcile()
+        assert controller._mqtt_reconcile_handle is first
+        await asyncio.sleep(0.01)
+
+    assert log == ["mqtt.reconcile"]
+    # The eagerly-run task completed and discarded itself from tracking.
+    assert controller._mqtt_reconcile_tasks == set()
+
+
+async def test_stop_cancels_pending_mqtt_nudge(tmp_path: Path, make_db: MakeDbFactory) -> None:
+    """A nudge still in its debounce window is cancelled by stop(), not fired."""
+    controller = DevicesController(make_db(tmp_path))
+
+    with _capture_monitor_and_mqtt(controller) as log:
+        controller.schedule_mqtt_reconcile()
+        assert controller._mqtt_reconcile_handle is not None
+        await controller.stop()
+
+    assert controller._mqtt_reconcile_handle is None
+    assert "mqtt.reconcile" not in log
+
+
+async def test_stop_drains_a_running_mqtt_nudge_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_db: MakeDbFactory
+) -> None:
+    """A nudge task still reconciling at stop() is drained, not orphaned."""
+    monkeypatch.setattr(
+        "esphome_device_builder.controllers.devices.controller._MQTT_RECONCILE_DEBOUNCE_SECONDS",
+        0.0,
+    )
+    controller = DevicesController(make_db(tmp_path))
+
+    async def _parked_reconcile(**_kw: object) -> None:
+        await asyncio.Event().wait()
+
+    with (
+        patch.multiple(controller._mqtt_coordinator, reconcile=_parked_reconcile, stop=AsyncMock()),
+        patch.multiple(controller._state_monitor, stop=AsyncMock()),
+    ):
+        controller.schedule_mqtt_reconcile()
+        await asyncio.sleep(0.01)
+        (task,) = controller._mqtt_reconcile_tasks
+        await controller.stop()
+
+    assert task.done()
+    assert controller._mqtt_reconcile_tasks == set()
+
+
+async def test_mqtt_nudge_fire_skips_reconcile_when_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_db: MakeDbFactory
+) -> None:
+    """A fire racing shutdown starts nothing."""
+    monkeypatch.setattr(
+        "esphome_device_builder.controllers.devices.controller._MQTT_RECONCILE_DEBOUNCE_SECONDS",
+        0.0,
+    )
+    controller = DevicesController(make_db(tmp_path))
+
+    with _capture_monitor_and_mqtt(controller) as log:
+        controller.schedule_mqtt_reconcile()
+        controller._stopped = True
+        await asyncio.sleep(0.01)
+
+    assert controller._mqtt_reconcile_tasks == set()
+    assert "mqtt.reconcile" not in log

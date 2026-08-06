@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import yaml
@@ -12,13 +13,15 @@ from ..yaml import FastestSafeLoader
 from ._parsing import _extract_resolved_substitutions
 
 
+@dataclass(frozen=True, slots=True)
 class SecretRef:
-    """Marker for an unresolved ``!secret <name>`` reference."""
+    """Marker for an unresolved ``!secret <name>`` reference.
 
-    __slots__ = ("name",)
+    Value equality matters: identity eq would defeat the reload event
+    suppression and the mqtt nudge gate for ``!secret`` blocks.
+    """
 
-    def __init__(self, name: str) -> None:
-        self.name = name
+    name: str
 
 
 def extract_mqtt_block(yaml_content: str) -> tuple[dict[str, Any] | None, dict[str, str]]:
@@ -51,6 +54,8 @@ def build_mqtt_extract(
     yaml_stat: os.stat_result,
     secrets_key: tuple[int, int],
     resolved_substitutions: dict[str, str],
+    *,
+    shallow: bool = False,
 ) -> DeviceMqttExtract:
     """Build the scan-time extraction the MQTT coordinator consumes."""
     main_block, main_subs = extract_mqtt_block(yaml_content)
@@ -66,6 +71,7 @@ def build_mqtt_extract(
         main_substitutions=main_subs,
         resolved_block=resolved_block,
         resolved_substitutions=resolved_substitutions,
+        from_shallow_load=shallow,
     )
 
 

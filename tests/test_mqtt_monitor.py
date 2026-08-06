@@ -15,6 +15,7 @@ import json
 import ssl
 import textwrap
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -27,7 +28,7 @@ from esphome_device_builder.controllers import (
 from esphome_device_builder.controllers import _device_mqtt_monitor as monitor_module
 from esphome_device_builder.controllers._device_mqtt_coordinator import (
     CLIENT_CERT_UNSUPPORTED,
-    _extract_broker_from_config,
+    _broker_from_mqtt_dict,
     parse_mqtt_block,
 )
 from esphome_device_builder.controllers._device_mqtt_monitor import (
@@ -42,6 +43,7 @@ from esphome_device_builder.helpers.subscriber_presence import SubscriberPresenc
 from esphome_device_builder.models import Device, DeviceState
 from tests._mqtt_fixtures import (
     RecordingMonitor,
+    build_test_extract,
     make_mqtt_coordinator,
     write_mqtt_device,
 )
@@ -155,7 +157,7 @@ def test_parse_mqtt_block_resolves_substitutions() -> None:
 
 def test_parse_mqtt_block_unresolved_substitution_returns_none() -> None:
     # No local substitutions block defines mqtt_host; the token must not
-    # become a host, so the caller falls through to the slow path.
+    # become a host, so the caller defers to the seed / reload path.
     yaml = "mqtt:\n  broker: ${mqtt_host}\n"
     assert parse_mqtt_block(yaml) is None
 
@@ -227,7 +229,7 @@ def test_parse_mqtt_block_resolves_ca_secret() -> None:
 
 def test_parse_mqtt_block_ca_include_returns_none() -> None:
     # An ``!include``d CA is invisible to the tolerant loader; a plaintext
-    # broker here would be wrong, so the caller must take the slow path.
+    # broker here would be wrong, so the caller must miss the fast tier.
     yaml = "mqtt:\n  broker: broker.example\n  certificate_authority: !include ca.pem\n"
     assert parse_mqtt_block(yaml) is None
 
@@ -304,15 +306,17 @@ def test_parse_mqtt_block_client_cert_returns_sentinel(cert_lines: str) -> None:
     assert parse_mqtt_block(yaml) is CLIENT_CERT_UNSUPPORTED
 
 
-def test_extract_broker_from_config_reads_tls_and_client_cert() -> None:
-    tls_config = {"mqtt": {"broker": "b.example", "certificate_authority": _TEST_CA_PEM}}
-    broker = _extract_broker_from_config(tls_config)
+def test_broker_from_mqtt_dict_reads_tls_and_client_cert() -> None:
+    tls_block = {"broker": "b.example", "certificate_authority": _TEST_CA_PEM}
+    broker = _broker_from_mqtt_dict(tls_block, {}, {})
     assert isinstance(broker, MqttBrokerConfig)
     assert broker.certificate_authority == _TEST_CA_PEM
-    client_cert_config = {
-        "mqtt": {"broker": "b.example", "client_certificate": "x", "client_certificate_key": "y"}
+    client_cert_block = {
+        "broker": "b.example",
+        "client_certificate": "x",
+        "client_certificate_key": "y",
     }
-    assert _extract_broker_from_config(client_cert_config) is CLIENT_CERT_UNSUPPORTED
+    assert _broker_from_mqtt_dict(client_cert_block, {}, {}) is CLIENT_CERT_UNSUPPORTED
 
 
 def test_mqtt_broker_config_key_groups_by_host_port_username() -> None:
@@ -760,18 +764,32 @@ async def test_coordinator_resolves_broker_pulled_in_via_packages(
     stub_monitor: type[RecordingMonitor],
 ) -> None:
     # Issue #893: mqtt block lives in a shared package, not the
-    # device file. Resolved-config fallback expands and resolves it.
+    # device file. The coordinator requests a deep reload, then
+    # resolves from the refreshed extract's package-merged block.
     (tmp_path / "common.yaml").write_text("mqtt:\n  broker: 192.168.1.203\n")
-    (tmp_path / "alpha.yaml").write_text(
-        "esphome:\n  name: alpha\npackages:\n  shared: !include common.yaml\n"
-    )
+    alpha_yaml = "esphome:\n  name: alpha\npackages:\n  shared: !include common.yaml\n"
+    alpha_path = tmp_path / "alpha.yaml"
+    alpha_path.write_text(alpha_yaml)
     device = Device(
         name="alpha",
         friendly_name="alpha",
         configuration="alpha.yaml",
         uses_mqtt=True,
     )
-    coord = make_mqtt_coordinator(tmp_path, [device])
+    devices = [device]
+    reloads: list[str] = []
+    coord = make_mqtt_coordinator(tmp_path, devices, reload_requests=reloads)
+
+    await coord.reconcile()
+    assert coord.active_brokers == 0
+    assert reloads == ["alpha.yaml"]
+
+    devices[0] = replace(
+        device,
+        mqtt_extract=build_test_extract(
+            alpha_path, alpha_yaml, {"mqtt": {"broker": "192.168.1.203"}}
+        ),
+    )
     await coord.reconcile()
     assert coord.active_brokers == 1
     assert stub_monitor.instances[0].broker.host == "192.168.1.203"
@@ -780,14 +798,9 @@ async def test_coordinator_resolves_broker_pulled_in_via_packages(
 async def test_coordinator_resolves_broker_from_local_substitution(
     tmp_path: Path,
     stub_monitor: type[RecordingMonitor],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Issue #1643: ${var} broker resolves from the file's own
-    # substitutions block in the fast path, without load_device_yaml.
-    def fail_loader(_path: Path) -> dict | None:
-        raise AssertionError("slow path must not run for a local substitution")
-
-    monkeypatch.setattr(coordinator_module, "load_device_yaml", fail_loader)
+    # substitutions block in the fast path, no reload needed.
     devices = [
         write_mqtt_device(
             tmp_path,
@@ -795,10 +808,12 @@ async def test_coordinator_resolves_broker_from_local_substitution(
             "substitutions:\n  mqtt_host: 192.0.2.10\nmqtt:\n  broker: ${mqtt_host}\n",
         )
     ]
-    coord = make_mqtt_coordinator(tmp_path, devices)
+    reloads: list[str] = []
+    coord = make_mqtt_coordinator(tmp_path, devices, reload_requests=reloads)
     await coord.reconcile()
     assert coord.active_brokers == 1
     assert stub_monitor.instances[0].broker.host == "192.0.2.10"
+    assert reloads == []
 
 
 async def test_coordinator_resolves_port_from_substitution(
@@ -813,28 +828,6 @@ async def test_coordinator_resolves_port_from_substitution(
     await coord.reconcile()
     assert coord.active_brokers == 1
     assert stub_monitor.instances[0].broker.port == 8883
-
-
-async def test_coordinator_resolves_broker_substitution_via_package(
-    tmp_path: Path,
-    stub_monitor: type[RecordingMonitor],
-) -> None:
-    (tmp_path / "common.yaml").write_text(
-        "substitutions:\n  mqtt_host: 192.168.1.77\nmqtt:\n  broker: ${mqtt_host}\n"
-    )
-    (tmp_path / "alpha.yaml").write_text(
-        "esphome:\n  name: alpha\npackages:\n  shared: !include common.yaml\n"
-    )
-    device = Device(
-        name="alpha",
-        friendly_name="alpha",
-        configuration="alpha.yaml",
-        uses_mqtt=True,
-    )
-    coord = make_mqtt_coordinator(tmp_path, [device])
-    await coord.reconcile()
-    assert coord.active_brokers == 1
-    assert stub_monitor.instances[0].broker.host == "192.168.1.77"
 
 
 async def test_coordinator_skips_unresolved_substitution(
@@ -861,22 +854,19 @@ async def test_coordinator_warns_once_per_unresolved_device(
     stub_monitor: type[RecordingMonitor],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # uses_mqtt set but no mqtt: present anywhere — neither path
-    # can resolve a broker.
-    (tmp_path / "alpha.yaml").write_text("esphome:\n  name: alpha\n")
-    device = Device(
-        name="alpha",
-        friendly_name="alpha",
-        configuration="alpha.yaml",
-        uses_mqtt=True,
-    )
-    coord = make_mqtt_coordinator(tmp_path, [device])
+    # A fresh deep extract that still can't resolve is genuinely
+    # unresolvable — warn once, and never loop on reload requests.
+    device = write_mqtt_device(tmp_path, "alpha", "mqtt:\n  broker: ${mqtt_host}\n")
+    reloads: list[str] = []
+    coord = make_mqtt_coordinator(tmp_path, [device], reload_requests=reloads)
 
     target = "esphome_device_builder.controllers._device_mqtt_coordinator"
     with caplog.at_level("DEBUG", logger=target):
         await coord.reconcile()
         await coord.reconcile()
         await coord.reconcile()
+
+    assert reloads == []
 
     warnings = [r for r in caplog.records if r.name == target and r.levelname == "WARNING"]
     debugs = [
@@ -897,23 +887,17 @@ async def test_coordinator_re_warns_after_broker_recovers_and_breaks_again(
 ) -> None:
     # Dedupe must reset on a successful resolve so a later
     # regression surfaces a fresh WARNING, not a DEBUG.
-    alpha_path = tmp_path / "alpha.yaml"
-    alpha_path.write_text("esphome:\n  name: alpha\n")
-    device = Device(
-        name="alpha",
-        friendly_name="alpha",
-        configuration="alpha.yaml",
-        uses_mqtt=True,
-    )
-    coord = make_mqtt_coordinator(tmp_path, [device])
+    broken = "mqtt:\n  broker: ${mqtt_host}\n"
+    devices = [write_mqtt_device(tmp_path, "alpha", broken)]
+    coord = make_mqtt_coordinator(tmp_path, devices)
 
     target = "esphome_device_builder.controllers._device_mqtt_coordinator"
     with caplog.at_level("WARNING", logger=target):
         await coord.reconcile()  # unresolved → WARNING #1
         await coord.reconcile()  # unresolved → DEBUG (suppressed)
-        alpha_path.write_text("esphome:\n  name: alpha\nmqtt:\n  broker: broker.local\n")
+        devices[0] = write_mqtt_device(tmp_path, "alpha", "mqtt:\n  broker: broker.local\n")
         await coord.reconcile()  # resolved → flag cleared
-        alpha_path.write_text("esphome:\n  name: alpha\n")
+        devices[0] = write_mqtt_device(tmp_path, "alpha", broken)
         await coord.reconcile()  # unresolved again → WARNING #2
 
     warnings = [
@@ -926,10 +910,9 @@ async def test_coordinator_re_warns_after_broker_recovers_and_breaks_again(
     assert len(warnings) == 2
 
 
-def test_extract_broker_from_config_returns_none_for_non_dict() -> None:
-    assert _extract_broker_from_config(None) is None
-    assert _extract_broker_from_config({"mqtt": "not-a-dict"}) is None
-    assert _extract_broker_from_config({}) is None
+def test_broker_from_mqtt_dict_returns_none_for_non_dict() -> None:
+    assert _broker_from_mqtt_dict(None, {}, {}) is None
+    assert _broker_from_mqtt_dict("not-a-dict", {}, {}) is None
 
 
 async def test_coordinator_skips_device_whose_yaml_vanishes_at_stat(
@@ -968,38 +951,31 @@ async def test_coordinator_skips_device_whose_yaml_vanishes_at_stat(
 async def test_coordinator_caches_resolved_broker_across_polls(
     tmp_path: Path,
     stub_monitor: type[RecordingMonitor],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # ``load_device_yaml`` can ``git clone`` remote packages —
-    # too expensive to run every 5 s. Once resolved, polls hit
-    # the cache until an mtime moves.
-    (tmp_path / "common.yaml").write_text("mqtt:\n  broker: 192.168.1.50\n")
-    (tmp_path / "alpha.yaml").write_text(
-        "esphome:\n  name: alpha\npackages:\n  shared: !include common.yaml\n"
-    )
+    # Once seed-resolved, polls hit the cache until an mtime moves —
+    # even if a later rebuild drops the seed.
+    alpha_yaml = "esphome:\n  name: alpha\npackages:\n  shared: !include common.yaml\n"
+    alpha_path = tmp_path / "alpha.yaml"
+    alpha_path.write_text(alpha_yaml)
+    seeded = build_test_extract(alpha_path, alpha_yaml, {"mqtt": {"broker": "192.168.1.50"}})
     device = Device(
         name="alpha",
         friendly_name="alpha",
         configuration="alpha.yaml",
         uses_mqtt=True,
+        mqtt_extract=seeded,
     )
-    coord = make_mqtt_coordinator(tmp_path, [device])
-
-    calls = 0
-    real_loader = coordinator_module.load_device_yaml
-
-    def counting_loader(path: Path) -> dict | None:
-        nonlocal calls
-        calls += 1
-        return real_loader(path)
-
-    monkeypatch.setattr(coordinator_module, "load_device_yaml", counting_loader)
+    devices = [device]
+    reloads: list[str] = []
+    coord = make_mqtt_coordinator(tmp_path, devices, reload_requests=reloads)
 
     await coord.reconcile()
-    await coord.reconcile()
-    await coord.reconcile()
-    assert calls == 1
     assert coord.active_brokers == 1
+
+    devices[0] = replace(device, mqtt_extract=replace(seeded, resolved_block=None))
+    await coord.reconcile()
+    assert coord.active_brokers == 1
+    assert reloads == []
 
 
 async def test_coordinator_recovers_when_negative_resolve_fixed_in_secrets(
@@ -1050,54 +1026,49 @@ async def test_coordinator_skips_devices_with_missing_yaml(
     assert warnings == [], [r.getMessage() for r in warnings]
 
 
-def test_extract_broker_from_config_handles_invalid_port() -> None:
-    config = {"mqtt": {"broker": "broker.local", "port": "not-a-number"}}
-    broker = _extract_broker_from_config(config)
+def test_broker_from_mqtt_dict_handles_invalid_port() -> None:
+    broker = _broker_from_mqtt_dict({"broker": "broker.local", "port": "not-a-number"}, {}, {})
     assert broker is not None
     assert broker.port == 1883
 
 
-def test_extract_broker_from_config_returns_none_when_broker_missing() -> None:
-    assert _extract_broker_from_config({"mqtt": {"username": "u"}}) is None
+def test_broker_from_mqtt_dict_returns_none_when_broker_missing() -> None:
+    assert _broker_from_mqtt_dict({"username": "u"}, {}, {}) is None
 
 
-def test_extract_broker_from_config_resolves_substitutions() -> None:
-    # load_device_yaml merges packages but skips the substitution pass.
-    config = {
-        "substitutions": {"mqtt_host": "192.168.1.203", "mqtt_port": "8883"},
-        "mqtt": {"broker": "${mqtt_host}", "port": "${mqtt_port}"},
-    }
-    broker = _extract_broker_from_config(config)
+def test_broker_from_mqtt_dict_resolves_substitutions() -> None:
+    # The seed carries the package-merged substitutions separately.
+    broker = _broker_from_mqtt_dict(
+        {"broker": "${mqtt_host}", "port": "${mqtt_port}"},
+        {},
+        {"mqtt_host": "192.168.1.203", "mqtt_port": "8883"},
+    )
     assert broker is not None
     assert broker.host == "192.168.1.203"
     assert broker.port == 8883
 
 
-def test_extract_broker_from_config_unresolved_substitution_returns_none() -> None:
-    assert _extract_broker_from_config({"mqtt": {"broker": "${mqtt_host}"}}) is None
+def test_broker_from_mqtt_dict_unresolved_substitution_returns_none() -> None:
+    assert _broker_from_mqtt_dict({"broker": "${mqtt_host}"}, {}, {}) is None
 
 
-def test_extract_broker_from_config_resolves_port_substitution() -> None:
-    config = {
-        "substitutions": {"mqtt_port": "8883"},
-        "mqtt": {"broker": "10.0.0.5", "port": "${mqtt_port}"},
-    }
-    broker = _extract_broker_from_config(config)
+def test_broker_from_mqtt_dict_resolves_port_substitution() -> None:
+    broker = _broker_from_mqtt_dict(
+        {"broker": "10.0.0.5", "port": "${mqtt_port}"}, {}, {"mqtt_port": "8883"}
+    )
     assert broker is not None
     assert broker.port == 8883
 
 
-def test_extract_broker_from_config_reads_resolved_block() -> None:
+def test_broker_from_mqtt_dict_reads_resolved_block() -> None:
     # Post-resolver shape — every field a plain scalar.
-    config = {
-        "mqtt": {
-            "broker": "192.168.1.203",
-            "port": 1883,
-            "username": "mquser",
-            "password": "topsecret",
-        }
+    block = {
+        "broker": "192.168.1.203",
+        "port": 1883,
+        "username": "mquser",
+        "password": "topsecret",
     }
-    broker = _extract_broker_from_config(config)
+    broker = _broker_from_mqtt_dict(block, {}, {})
     assert broker == MqttBrokerConfig(
         host="192.168.1.203",
         port=1883,
@@ -2876,3 +2847,239 @@ def test_decode_payload_returns_empty_for_unsupported_types() -> None:
     assert _decode_payload(12345) == ""
     assert _decode_payload({"not": "supported"}) == ""
     assert _decode_payload(["nope"]) == ""
+
+
+async def test_coordinator_cancel_mid_stop_keeps_monitor_registered(
+    tmp_path: Path,
+    stub_monitor: type[RecordingMonitor],
+) -> None:
+    """A cancel during a monitor's teardown leaves it registered for ``stop()`` to find."""
+    devices = [write_mqtt_device(tmp_path, "alpha", "mqtt:\n  broker: 192.168.1.10\n")]
+    coord = make_mqtt_coordinator(tmp_path, devices)
+    await coord.reconcile()
+    assert coord.active_brokers == 1
+    monitor = stub_monitor.instances[0]
+
+    async def _cancelled_stop() -> None:
+        raise asyncio.CancelledError
+
+    devices[0] = write_mqtt_device(tmp_path, "alpha", None)
+
+    with (
+        patch.object(monitor, "stop", _cancelled_stop),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await coord.reconcile()
+
+    assert coord.active_brokers == 1
+
+    await coord.stop()
+    assert coord.active_brokers == 0
+    assert monitor.stopped is True
+
+
+async def test_coordinator_stop_bounded_when_reconcile_lock_held(
+    tmp_path: Path,
+    stub_monitor: type[RecordingMonitor],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wedged reconcile can't stall shutdown; ``stop()`` times out and still stops monitors."""
+    devices = [write_mqtt_device(tmp_path, "alpha", "mqtt:\n  broker: 192.168.1.10\n")]
+    coord = make_mqtt_coordinator(tmp_path, devices)
+    await coord.reconcile()
+    monitor = stub_monitor.instances[0]
+    monkeypatch.setattr(coordinator_module, "_STOP_LOCK_TIMEOUT_SECONDS", 0.01)
+    await coord._reconcile_lock.acquire()
+
+    await coord.stop()
+
+    assert monitor.stopped is True
+    assert coord.active_brokers == 0
+    # The holder's lock is untouched — stop() never acquired it.
+    assert coord._reconcile_lock.locked()
+
+
+async def test_coordinator_reconcile_after_stop_starts_nothing(
+    tmp_path: Path,
+    stub_monitor: type[RecordingMonitor],
+) -> None:
+    """A reconcile that outlives ``stop()`` must not restart monitors."""
+    devices = [write_mqtt_device(tmp_path, "alpha", "mqtt:\n  broker: 192.168.1.10\n")]
+    coord = make_mqtt_coordinator(tmp_path, devices)
+
+    await coord.stop()
+    await coord.reconcile()
+
+    assert coord.active_brokers == 0
+    assert stub_monitor.instances == []
+
+
+async def test_coordinator_reload_lands_and_next_pass_starts_the_broker(
+    tmp_path: Path,
+    stub_monitor: type[RecordingMonitor],
+) -> None:
+    """A shallow-extract device defers via a reload request; the next pass starts it."""
+    alpha_yaml = "esphome:\n  name: alpha\nmqtt:\n  broker: ${mqtt_host}\n"
+    alpha_path = tmp_path / "alpha.yaml"
+    alpha_path.write_text(alpha_yaml)
+    device = Device(
+        name="alpha",
+        friendly_name="alpha",
+        configuration="alpha.yaml",
+        uses_mqtt=True,
+        mqtt_extract=build_test_extract(alpha_path, alpha_yaml, shallow=True),
+    )
+    devices = [device]
+    reloads: list[str] = []
+    coord = make_mqtt_coordinator(tmp_path, devices, reload_requests=reloads)
+
+    await coord.reconcile()
+    assert coord.active_brokers == 0
+    assert reloads == ["alpha.yaml"]
+
+    devices[0] = replace(
+        device,
+        mqtt_extract=build_test_extract(
+            alpha_path,
+            alpha_yaml,
+            {"mqtt": {"broker": "${mqtt_host}"}},
+            {"mqtt_host": "192.168.1.77"},
+        ),
+    )
+    await coord.reconcile()
+    assert coord.active_brokers == 1
+    assert stub_monitor.instances[0].broker.host == "192.168.1.77"
+
+
+async def test_coordinator_stale_extract_requests_reload(
+    tmp_path: Path,
+    stub_monitor: type[RecordingMonitor],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An edited-since-scan unresolvable device defers to a reload, silently."""
+    device = write_mqtt_device(tmp_path, "alpha", "mqtt:\n  broker: 10.0.0.5\n")
+    (tmp_path / "alpha.yaml").write_text(
+        "esphome:\n  name: alpha\n\nmqtt:\n  broker: ${package_host}\n"
+    )
+    reloads: list[str] = []
+    coord = make_mqtt_coordinator(tmp_path, [device], reload_requests=reloads)
+
+    target = "esphome_device_builder.controllers._device_mqtt_coordinator"
+    with caplog.at_level("WARNING", logger=target):
+        await coord.reconcile()
+
+    assert coord.active_brokers == 0
+    assert reloads == ["alpha.yaml"]
+    assert [r for r in caplog.records if r.name == target and r.levelname == "WARNING"] == []
+
+
+async def test_coordinator_defers_teardown_while_reloads_pending(
+    tmp_path: Path,
+    stub_monitor: type[RecordingMonitor],
+) -> None:
+    """A pass with unresolved devices never stops monitors it can't account for."""
+    devices = [write_mqtt_device(tmp_path, "alpha", "mqtt:\n  broker: 10.0.0.5\n")]
+    reloads: list[str] = []
+    coord = make_mqtt_coordinator(tmp_path, devices, reload_requests=reloads)
+    await coord.reconcile()
+    assert coord.active_brokers == 1
+
+    beta_yaml = "esphome:\n  name: beta\nmqtt:\n  broker: ${package_host}\n"
+    beta_path = tmp_path / "beta.yaml"
+    beta_path.write_text(beta_yaml)
+    devices[0] = write_mqtt_device(tmp_path, "alpha", None)
+    devices.append(
+        Device(
+            name="beta",
+            friendly_name="beta",
+            configuration="beta.yaml",
+            uses_mqtt=True,
+            mqtt_extract=build_test_extract(beta_path, beta_yaml, shallow=True),
+        )
+    )
+
+    await coord.reconcile()
+    assert reloads == ["beta.yaml"]
+    # Alpha's monitor survives the deferred pass.
+    assert coord.active_brokers == 1
+    assert stub_monitor.instances[0].stopped is False
+
+    devices[1] = replace(
+        devices[1],
+        mqtt_extract=build_test_extract(
+            beta_path,
+            beta_yaml,
+            {"mqtt": {"broker": "${package_host}"}},
+            {"package_host": "10.9.9.9"},
+        ),
+    )
+    await coord.reconcile()
+    # Beta resolved and started; alpha's stale monitor finally torn down.
+    assert stub_monitor.instances[0].stopped is True
+    assert coord.active_brokers == 1
+    assert stub_monitor.instances[1].broker.host == "10.9.9.9"
+
+
+async def test_coordinator_reconcile_survives_stop_during_teardown(
+    tmp_path: Path,
+    stub_monitor: type[RecordingMonitor],
+) -> None:
+    """A ``stop()`` landing mid-teardown neither crashes the pass nor restarts monitors."""
+    devices = [
+        write_mqtt_device(tmp_path, "alpha", "mqtt:\n  broker: 10.0.0.1\n"),
+        write_mqtt_device(tmp_path, "beta", "mqtt:\n  broker: 10.0.0.2\n"),
+    ]
+    coord = make_mqtt_coordinator(tmp_path, devices)
+    await coord.reconcile()
+    assert coord.active_brokers == 2
+
+    async def _concurrent_stop() -> None:
+        coord._stopped = True
+        coord._monitors.clear()
+
+    devices[:] = [
+        write_mqtt_device(tmp_path, "alpha", None),
+        write_mqtt_device(tmp_path, "beta", None),
+    ]
+    with (
+        patch.object(stub_monitor.instances[0], "stop", _concurrent_stop),
+        patch.object(stub_monitor.instances[1], "stop", _concurrent_stop),
+    ):
+        await coord.reconcile()
+
+    assert coord.active_brokers == 0
+    assert len(stub_monitor.instances) == 2
+
+
+async def test_coordinator_skips_monitor_starts_when_stopped_mid_pass(
+    tmp_path: Path,
+    stub_monitor: type[RecordingMonitor],
+) -> None:
+    """A ``stop()`` landing before the start loop leaves new monitors unstarted."""
+    devices = [write_mqtt_device(tmp_path, "alpha", "mqtt:\n  broker: 10.0.0.1\n")]
+    coord = make_mqtt_coordinator(tmp_path, devices)
+
+    def _stop_during_election() -> None:
+        coord._stopped = True
+
+    with patch.object(coord, "_assign_publishers", _stop_during_election):
+        await coord.reconcile()
+
+    assert stub_monitor.instances[0].started is False
+
+
+async def test_coordinator_resume_clears_the_stop_latch(
+    tmp_path: Path,
+    stub_monitor: type[RecordingMonitor],
+) -> None:
+    """A restarted owner reconciles again after ``resume()``."""
+    devices = [write_mqtt_device(tmp_path, "alpha", "mqtt:\n  broker: 10.0.0.1\n")]
+    coord = make_mqtt_coordinator(tmp_path, devices)
+
+    await coord.stop()
+    await coord.reconcile()
+    assert coord.active_brokers == 0
+
+    coord.resume()
+    await coord.reconcile()
+    assert coord.active_brokers == 1
