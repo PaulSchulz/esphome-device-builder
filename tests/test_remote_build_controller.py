@@ -5021,7 +5021,7 @@ def test_dashboard_display_identity_falls_back_without_advertiser(
 ) -> None:
     """No advertiser (zeroconf down) → the hostname-derived default label."""
     monkeypatch.setattr(
-        "esphome_device_builder.controllers.remote_build.display_identity.default_friendly_name",
+        "esphome_device_builder.helpers.dashboard_advertise.default_friendly_name",
         lambda: "fallback-host",
     )
     db = MagicMock()
