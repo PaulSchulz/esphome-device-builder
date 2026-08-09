@@ -980,6 +980,7 @@ def main() -> int:
     _sweep_registry_rename_keys()
     _sweep_component_aliases()
     _fail_on_unhandled_renames()
+    _fail_on_unhandled_repr_keys()
 
     # Collected (and guarded) before any emit so the abort below leaves
     # the tree untouched; ``build_catalog``'s import sweep has already
@@ -1028,6 +1029,8 @@ def main() -> int:
             len(automations["conditions"]),
             len(automations["light_effects"]),
         )
+        # Guards the automations emit; components are already on disk.
+        _fail_on_unhandled_repr_keys()
         _emit_split_automations_catalog(automations, version)
     else:
         _LOGGER.warning(
@@ -2898,6 +2901,27 @@ def _merge_extends_config_vars(
     return merged, {key: ref for key, ref in origin_ref.items() if key not in config_vars}
 
 
+def _drop_opaque_key(component_id: str, key: str, raw: dict | None) -> bool:
+    """
+    Drop a stringified-object key, recording unacknowledged ones for the canary.
+
+    Two dumper spellings: the leaked repr (``<function ... at 0x...>``,
+    or one embedded in a larger key) and the normalized ``string``
+    placeholder carrying the validator in ``key_type``
+    (esphome/esphome#18218).
+    """
+    if (key.startswith("<") and key.endswith(">")) or _REPR_ADDRESS_RE.search(key):
+        match = _REPR_KEY_RE.match(key)
+        if match is None or match.group(1) not in _HANDLED_WILDCARD_KEYS:
+            _UNHANDLED_REPR_KEYS.add((component_id, key))
+        return True
+    if key == "string" and isinstance(raw, dict) and "key_type" in raw:
+        if raw["key_type"] not in _HANDLED_WILDCARD_KEYS:
+            _UNHANDLED_REPR_KEYS.add((component_id, f"string[key_type={raw['key_type']}]"))
+        return True
+    return False
+
+
 def _convert_config_vars(
     schema_node: dict,
     schema_dir: Path,
@@ -2916,6 +2940,8 @@ def _convert_config_vars(
     out: list[dict] = []
     for key, raw in merged.items():
         if key in _SKIP_KEYS:
+            continue
+        if _drop_opaque_key(component_id, key, raw):
             continue
         if (component_id, key) in _DEPRECATED_FIELDS:
             continue
@@ -8275,6 +8301,21 @@ _MIGRATION_RULES: set[tuple[str, str, str, str, str, str]] = set()
 #: introspection's best-effort early returns silenced the canary.
 _RENAME_SWEEP_COUNT = [0]
 
+_REPR_KEY_RE = re.compile(r"^<function (\w+) at 0x[0-9a-f]+>$")
+
+# A key legitimately never contains an address, so unanchored is safe.
+_REPR_ADDRESS_RE = re.compile(r" at 0x[0-9a-f]+")
+
+#: Callable wildcard matchers acknowledged as deliberately dropped.
+#: ``validate_parameter_name``: script.execute accepts arbitrary
+#: user-defined parameter names as action keys; the editor's dynamic
+#: parameter form is driven by the scripts snapshot, not the catalog.
+_HANDLED_WILDCARD_KEYS = frozenset({"validate_parameter_name"})
+
+#: ``(component_id, key)``; component_id is "" on automation and nested
+#: paths — the repr itself names the validator, enough to locate it.
+_UNHANDLED_REPR_KEYS: set[tuple[str, str]] = set()
+
 
 def _note_unhandled_rename_keys(component_id: str, pairs: Iterable[tuple[str, str]]) -> None:
     """Record every discovered rename pair missing from the handled list."""
@@ -8384,6 +8425,23 @@ def _fail_on_unhandled_renames() -> None:
             f"{rows}\n"
             "Add bespoke handling for each, then acknowledge it in _HANDLED_ALIASES."
         )
+
+
+def _fail_on_unhandled_repr_keys() -> None:
+    """Abort when the bundle carries a callable-repr config-var key we don't handle."""
+    if not _UNHANDLED_REPR_KEYS:
+        return
+    rows = "\n".join(
+        f"  {component or '(automation schema)'}: {key}"
+        for component, key in sorted(_UNHANDLED_REPR_KEYS)
+    )
+    raise SystemExit(
+        "the schema bundle carries callable-repr config-var keys the "
+        "dashboard doesn't handle:\n"
+        f"{rows}\n"
+        "Decide whether the wildcard maps to a real editor surface or is "
+        "dropped, then extend _HANDLED_WILDCARD_KEYS."
+    )
 
 
 def _collect_rename_keys(manifest: Any) -> dict[tuple[str, str], bool]:
@@ -9731,6 +9789,8 @@ def _extract_automation_param_schema(
     stripped: set[str] = set()
     for key, raw in _merge_extends_config_vars(schema, schema_dir)[0].items():
         if not isinstance(raw, dict):
+            continue
+        if _drop_opaque_key("", key, raw):
             continue
         rtype = raw.get("type")
         if rtype == "trigger" or (rtype == "registry" and raw.get("registry") == "action"):
