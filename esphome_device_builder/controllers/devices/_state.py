@@ -39,15 +39,15 @@ class RegenState:
     """
     Bookkeeping for background ``--only-generate`` runs.
 
-    ``pending`` dedupes in-flight schedules, ``failed`` blocks retries
-    until the YAML changes, and the retry fields drive the bounded
-    escalating retry between a failure and the disk stamp.
+    ``pending`` dedupes in-flight schedules; ``retry_timers`` holds the
+    armed backoff retries. Failure history (attempt count, stamp) lives
+    in the metadata store; ``unreadable_strikes`` counts stat failures
+    the stamp can't key (no mtime to record against).
     """
 
     pending: set[str] = field(default_factory=set)
-    failed: set[str] = field(default_factory=set)
     retry_timers: dict[str, asyncio.TimerHandle] = field(default_factory=dict)
-    retry_strikes: dict[str, int] = field(default_factory=dict)
+    unreadable_strikes: dict[str, int] = field(default_factory=dict)
 
     def arm_retry(self, configuration: str, handle: asyncio.TimerHandle) -> None:
         """Install *handle* as the pending retry, cancelling any prior one."""
@@ -56,20 +56,35 @@ class RegenState:
             existing.cancel()
         self.retry_timers[configuration] = handle
 
-    def reset(self, configuration: str) -> None:
-        """Drop *configuration*'s failure marker, retry timer, and strikes."""
-        self.failed.discard(configuration)
+    def cancel_retry(self, configuration: str) -> bool:
+        """Cancel and drop *configuration*'s retry timer; True iff one was armed."""
         handle = self.retry_timers.pop(configuration, None)
-        if handle is not None:
-            handle.cancel()
-        self.retry_strikes.pop(configuration, None)
+        if handle is None:
+            return False
+        handle.cancel()
+        return True
+
+    def record_strike(self, configuration: str) -> int:
+        """Count one more stat failure against *configuration*; returns the streak."""
+        strikes = self.unreadable_strikes.get(configuration, 0) + 1
+        self.unreadable_strikes[configuration] = strikes
+        return strikes
+
+    def clear_strikes(self, configuration: str) -> None:
+        """Drop *configuration*'s stat-failure streak."""
+        self.unreadable_strikes.pop(configuration, None)
+
+    def forget(self, configuration: str) -> bool:
+        """Drop all in-RAM regen bookkeeping for *configuration*; True iff a retry was armed."""
+        self.clear_strikes(configuration)
+        return self.cancel_retry(configuration)
 
     def cancel_all_retry_timers(self) -> None:
-        """Cancel every pending retry timer and drop the strike counts."""
+        """Cancel every pending retry timer and drop the strike streaks."""
         for handle in self.retry_timers.values():
             handle.cancel()
         self.retry_timers.clear()
-        self.retry_strikes.clear()
+        self.unreadable_strikes.clear()
 
 
 @dataclass

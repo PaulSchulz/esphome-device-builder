@@ -402,26 +402,33 @@ Two rules the refine established that every later caller inherits:
   reload-driven path (labels, build size, post-compile refresh) now means "the
   row changed", not "a reload ran". The gate suppresses every RELOADED side
   effect in `on_scan_change`, not just the frame — all are implied by row
-  equality except the regen failure marker: `RELOADED` discards it, while the
-  armed retry timer and strike count deliberately survive (the cold-start
-  refine's `RELOADED` burst must not cancel a pending recovery); the full
-  `regen.reset` runs only on `UPDATED`/`REMOVED`, whose real repair path is a
-  YAML edit anyway.
+  equality; RELOADED touches no regen state at all (an armed retry survives
+  the cold-start refine's RELOADED burst, and the failure stamp is repaired
+  by the fields a successful compile fills).
 - **The refine emits `RELOADED`, never `UPDATED`.** `DEVICE_YAML_UPDATED`
   (version-history commits) keys on `UPDATED`, and the network-fingerprint
   regen deliberately skips `RELOADED` (it fires on `ADDED`/`UPDATED` to catch
   out-of-band edits), so a restart's refine burst can neither commit to git
   nor spawn `--only-generate` per device.
-- **Regen failures retry before they stamp** (#2532). A failed
-  `--only-generate` gets a bounded escalating retry (3 attempts, 30/60/120s)
-  before the session `regen.failed` marker and the one-hour disk stamp — a
-  transient environment failure (interrupted package clone, DNS) is
-  indistinguishable from a broken YAML without parsing subprocess stderr, so
-  every failure retries. The stamp is written only once the budget is spent;
-  a shutdown mid-window stamps any armed retries first so a restart loop
-  can't spend a fresh budget each cycle. Success at any attempt clears the
-  ladder and reloads the scanner, which also repairs an earlier swallowed
-  in-process package resolve.
+- **Regen failures ladder through the metadata store** (#2532, #2534). A
+  failed `--only-generate` earns a bounded escalating retry (4 attempts,
+  30/60/120s between them) — a transient environment failure (interrupted
+  package clone, DNS) is indistinguishable from a broken YAML without
+  parsing subprocess output, so every failure retries. Every failure stamps
+  the store (`regen_failed_mtime`/`_at`/`_attempts`), making the stamp the
+  single source of truth: the ladder resumes across restarts at the recorded
+  attempt (a restart inside a backoff window re-arms the *remainder*, not an
+  immediate spawn), a spent budget holds until the YAML's mtime moves or the
+  four-hour TTL expires (a timer re-checks at expiry, so an untouched file
+  recovers without a scan event), and shutdown only cancels the in-RAM
+  timers. An edit resets the ladder by construction — failures stamp against
+  the pre-spawn mtime, so even an edit landing mid-run starts fresh. Success
+  at any attempt clears the stamp triple and reloads the scanner, which also
+  repairs an earlier swallowed in-process package resolve; a run cancelled
+  mid-subprocess kills the child and records nothing (an interrupted clone
+  is not evidence of failure), a hung run is killed after five minutes and
+  counts as a failure, and the give-up warning carries the last failure's
+  summary.
 
 ## Authentication
 
