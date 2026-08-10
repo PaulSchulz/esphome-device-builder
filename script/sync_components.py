@@ -1333,6 +1333,16 @@ def build_catalog(
     # ``ota.http_request``).
     _backfill_descriptions_from_mdx(out)
 
+    # Prepend a markdown hint to each constraint-involved field's
+    # description so an older frontend (one that doesn't yet
+    # consume ``required_groups`` / ``group``) still surfaces the
+    # rule to the user as readable prose — issue #924. Drops out
+    # naturally once the FE renders the structured fields inline.
+    # After the MDX backfill: the backfill fills only description-less
+    # fields, so an earlier hint would block the prose and help_link.
+    for entry in out:
+        _annotate_constraint_descriptions(entry)
+
     # After the MDX backfill so a real MDX title still wins.
     _fix_borrowed_page_titles(out, _components_with_own_docs_page())
 
@@ -2724,12 +2734,9 @@ def build_component_entry(
     # nested ``NESTED`` entries; the applier needs the whole
     # component dict to stamp both locations.
     _apply_required_groups(component, introspection.get("required_groups") or {})
-    # Prepend a markdown hint to each constraint-involved field's
-    # description so an older frontend (one that doesn't yet
-    # consume ``required_groups`` / ``group``) still surfaces the
-    # rule to the user as readable prose — issue #924. Drops out
-    # naturally once the FE renders the structured fields inline.
-    _annotate_constraint_descriptions(component)
+    # Constraint-hint annotation is deferred to ``build_catalog`` — it must
+    # run after the MDX backfill, whose fill targets only description-less
+    # fields; a hint stamped here would block the prose and its help_link.
     _apply_ethernet_platform_split(component)
     return component
 
@@ -4890,14 +4897,11 @@ def _collect_bleed_keys(
         }
         if bled:
             range_bleed[domain] = bled
-        # Refined types walk list items, so the key set must too or the
-        # guard is blind to list-item paths.
-        list_keys = _platform_field_keys([platform_manifest], descend_list_items=True)
         platform_refined = _collect_refined_types(platform_manifest)
         refined_bled = {
             path: platform_refined.get(path)
             for path in hub_refined
-            if path in list_keys and platform_refined.get(path) != hub_refined[path]
+            if path in keys and platform_refined.get(path) != hub_refined[path]
         }
         if refined_bled:
             refined_bleed[domain] = refined_bled
@@ -5587,11 +5591,14 @@ def _ensure_list_item_validator(node: Any) -> Any | None:
     return None
 
 
+def _list_item_schema(node: Any) -> Any | None:
+    """Return the item schema of a ``cv.ensure_list`` node (peeling ``cv.templatable``), or None."""
+    return _ensure_list_item_validator(_templatable_inner(node) or node)
+
+
 def _walk_schema_keys(
     schema: Any,
     visit: Callable[[Any, str, Any, tuple[str, ...]], None],
-    *,
-    descend_list_items: bool = False,
 ) -> None:
     """
     Walk *schema* and call ``visit(key, key_name, val, path)`` per dict entry.
@@ -5616,9 +5623,9 @@ def _walk_schema_keys(
     sub-schema shared between two fields must be visited at both paths
     or whichever comes second is silently shadowed.
 
-    ``descend_list_items`` additionally walks into ``cv.ensure_list``
-    item schemas at the same path (the catalog keys list-item fields
-    under the list field itself, e.g. ``(uart, stop_bits)``).
+    ``cv.ensure_list`` item schemas are walked at the same path (the
+    catalog keys list-item fields under the list field itself, e.g.
+    ``(uart, stop_bits)``).
     """
     visited: set[tuple[int, tuple[str, ...]]] = set()
 
@@ -5633,12 +5640,10 @@ def _walk_schema_keys(
             # no path segment) so the collectors reach variant-only fields
             # like ethernet's ``clock_speed``.
             branches = _typed_branch_schemas(node)
-            if branches is None and descend_list_items:
-                # ``cv.ensure_list(...)`` is also a closure, sometimes
-                # behind a ``cv.templatable`` wrapper; the peel matters
-                # only for mapping-shaped items (a scalar item types the
-                # parent entry via ``classify`` instead).
-                item = _ensure_list_item_validator(_templatable_inner(node) or node)
+            if branches is None:
+                # ``cv.ensure_list(...)`` is also a closure, not a
+                # ``vol.*`` wrapper.
+                item = _list_item_schema(node)
                 branches = {"": item} if item is not None else None
             for branch in (branches or {}).values():
                 walk(branch, path, depth + 1)
@@ -6186,7 +6191,7 @@ def _refined_types_in_schema(  # noqa: C901
         elif _is_dict_list_union(val):
             out[path] = RefinedType("unknown")
 
-    _walk_schema_keys(schema, visit, descend_list_items=True)
+    _walk_schema_keys(schema, visit)
     return out
 
 
@@ -6289,7 +6294,7 @@ def _collect_component_gates(manifest: Any) -> dict[tuple[str, ...], str]:
         if gate is not None:
             out[path] = gate
 
-    _walk_schema_keys(schema, visit, descend_list_items=True)
+    _walk_schema_keys(schema, visit)
 
     visited_set = set(visited)
     by_parent: dict[tuple[str, ...], list[tuple[str, ...]]] = {}
@@ -7601,7 +7606,7 @@ def _collect_platform_constraints(
         if constraint:
             out[path] = sorted(constraint)
 
-    _walk_schema_keys(schema, visit, descend_list_items=True)
+    _walk_schema_keys(schema, visit)
     return out
 
 
@@ -7754,6 +7759,11 @@ def _collect_required_groups(
             out.setdefault(path, []).extend(groups)
         target = _unwrap_schema_to_dict(node)
         if target is None:
+            # A constraint on a ``cv.ensure_list`` item schema lands at the
+            # list field's own path, matching the catalog's nesting.
+            item = _list_item_schema(node)
+            if item is not None:
+                walk(item, path, depth + 1)
             return
         if id(target) in visited:
             return
@@ -8164,20 +8174,14 @@ def _drop_machine_derived_ranges(
     return {path: bounds for path, bounds in field_ranges.items() if path not in denylisted}
 
 
-def _platform_field_keys(
-    platform_manifests: list[Any], *, descend_list_items: bool = False
-) -> set[tuple[str, ...]]:
-    """Every config-var key path defined across *platform_manifests*' schemas."""
+def _platform_field_keys(platform_manifests: list[Any]) -> set[tuple[str, ...]]:
+    """Every config-var key path (list-item paths included) across *platform_manifests*' schemas."""
     keys: set[tuple[str, ...]] = set()
     for manifest in platform_manifests:
         schema = getattr(manifest, "config_schema", None)
         if schema is None:
             continue
-        _walk_schema_keys(
-            schema,
-            lambda _k, _kn, _v, path: keys.add(path),
-            descend_list_items=descend_list_items,
-        )
+        _walk_schema_keys(schema, lambda _k, _kn, _v, path: keys.add(path))
     return keys
 
 
