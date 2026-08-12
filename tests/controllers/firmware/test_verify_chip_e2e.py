@@ -63,12 +63,14 @@ import asyncio
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from esphome_device_builder.controllers.firmware import FirmwareController
+from esphome_device_builder.controllers.firmware import _state as state_module
 from esphome_device_builder.controllers.firmware import runner as runner_module
+from esphome_device_builder.controllers.firmware._state import SpawnHandle
 from esphome_device_builder.models import (
     FirmwareJob,
     JobStatus,
@@ -514,7 +516,7 @@ async def test_cancel_during_hanging_verify_chip_terminates_subprocess(
     the sleep duration. The only way that's possible is if the
     SIGTERM actually landed on the verify subprocess — which
     requires the spawn to have been registered in
-    ``state.processes``.
+    ``state.spawns``.
     """
     controller = firmware_controller_factory(with_queue=True)
     _wire_real_queue(controller)
@@ -554,7 +556,7 @@ async def test_cancel_during_hanging_verify_chip_terminates_subprocess(
     async def _cancel_when_verify_starts() -> None:
         await verify_spawned.wait()
         # Wait until the runner has registered the verify subprocess
-        # in ``state.processes``. The wrapper's ``verify_spawned``
+        # in ``state.spawns``. The wrapper's ``verify_spawned``
         # fires INSIDE the ``await create_subprocess_exec`` call —
         # ``_verify_chip`` hasn't received the proc back yet, so
         # firing the cancel right here would hit the very race we're
@@ -562,7 +564,7 @@ async def test_cancel_during_hanging_verify_chip_terminates_subprocess(
         # ``_terminate_job_process`` no-ops). The poll proves the
         # registration happens BEFORE the runner waits on the proc,
         # which is the contract that makes mid-verify cancel work.
-        while job.job_id not in controller.state.processes:
+        while job.job_id not in controller.state.spawns:
             await asyncio.sleep(0.01)
         await controller.cancel(job_id=job.job_id)
 
@@ -660,7 +662,7 @@ async def test_tracked_subprocess_registers_and_clears_process(
 
     Pin the contract:
 
-    1. Inside the ``async with`` block, ``state.processes[job_id]``
+    1. Inside the ``async with`` block, ``state.spawns[job_id]``
        IS the spawned proc (so SIGTERM via ``cancel`` lands on it).
     2. After the block exits cleanly, the entry returns to its
        prior value (absent here, but the helper restores
@@ -668,7 +670,7 @@ async def test_tracked_subprocess_registers_and_clears_process(
     """
     controller = firmware_controller_factory(with_settings=False, with_terminate=True)
     job = _make_job("j1")
-    assert job.job_id not in controller.state.processes
+    assert job.job_id not in controller.state.spawns
 
     async with controller._tracked_subprocess(
         job,
@@ -678,42 +680,11 @@ async def test_tracked_subprocess_registers_and_clears_process(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     ) as proc:
-        assert controller.state.processes[job.job_id] is proc
+        assert controller.state.spawns[job.job_id].proc is proc
         await proc.wait()
 
     # Restored on exit.
-    assert job.job_id not in controller.state.processes
-
-
-async def test_tracked_subprocess_restores_prior_value_on_exit(
-    firmware_controller_factory: FirmwareControllerFactory,
-) -> None:
-    """``_tracked_subprocess`` restores the prior registry entry.
-
-    The helper saves whatever was registered before it spawned
-    and restores it on exit, so a future caller that uses the
-    helper inside an outer one (or just after another spawn site
-    that's already populated the entry) doesn't accidentally
-    drop the active process reference. Absent is the
-    common case but the contract is "restore the prior value".
-    """
-    controller = firmware_controller_factory(with_settings=False, with_terminate=True)
-    job = _make_job("j1")
-    sentinel = object()
-    controller.state.processes[job.job_id] = sentinel  # type: ignore[assignment]
-
-    async with controller._tracked_subprocess(
-        job,
-        sys.executable,
-        "-c",
-        "import sys\nsys.exit(0)\n",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    ) as proc:
-        assert controller.state.processes[job.job_id] is proc  # registered for the duration
-        await proc.wait()
-
-    assert controller.state.processes[job.job_id] is sentinel  # restored
+    assert job.job_id not in controller.state.spawns
 
 
 async def test_tracked_subprocess_restores_prior_value_on_exception(
@@ -730,7 +701,7 @@ async def test_tracked_subprocess_restores_prior_value_on_exception(
     """
     controller = firmware_controller_factory(with_settings=False, with_terminate=True)
     job = _make_job("j1")
-    assert job.job_id not in controller.state.processes
+    assert job.job_id not in controller.state.spawns
 
     with pytest.raises(RuntimeError, match="boom"):
         async with controller._tracked_subprocess(
@@ -751,7 +722,116 @@ async def test_tracked_subprocess_restores_prior_value_on_exception(
             msg = "boom"
             raise RuntimeError(msg)
 
-    assert job.job_id not in controller.state.processes
+    assert job.job_id not in controller.state.spawns
+
+
+async def test_tracked_subprocess_terminates_spawn_on_cancellation(
+    firmware_controller_factory: FirmwareControllerFactory,
+) -> None:
+    """A cancellation unwinding the body terminates the spawn and still propagates."""
+    controller = firmware_controller_factory(with_settings=False, with_terminate=True)
+    job = _make_job("j1")
+
+    with pytest.raises(asyncio.CancelledError):
+        async with controller._tracked_subprocess(
+            job,
+            sys.executable,
+            "-c",
+            "import sys\nsys.exit(0)\n",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        ) as proc:
+            await proc.wait()
+            raise asyncio.CancelledError
+
+    controller._terminate_job_process.assert_awaited_once_with(job)
+    assert job.job_id not in controller.state.spawns
+
+
+class _FakeJobObject:
+    """``WindowsJobObject`` stand-in recording ``close()`` calls."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def _force_job_object(monkeypatch: pytest.MonkeyPatch, job_obj: _FakeJobObject | None) -> None:
+    """Stub ``SpawnHandle.track``'s ``create_for_pid`` to return *job_obj*."""
+    stub = MagicMock()
+    stub.create_for_pid.return_value = job_obj
+    monkeypatch.setattr(state_module, "WindowsJobObject", stub)
+
+
+async def test_tracked_subprocess_registers_and_closes_job_object(
+    firmware_controller_factory: FirmwareControllerFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The spawn's kill handle is held for the run and closed on exit."""
+    controller = firmware_controller_factory(with_settings=False, with_terminate=True)
+    job = _make_job("j1")
+    fake = _FakeJobObject()
+    _force_job_object(monkeypatch, fake)
+
+    async with controller._tracked_subprocess(
+        job,
+        sys.executable,
+        "-c",
+        "import sys\nsys.exit(0)\n",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    ) as proc:
+        assert controller.state.spawns[job.job_id].win_job is fake
+        await proc.wait()
+
+    assert job.job_id not in controller.state.spawns
+    assert fake.close_calls == 1
+
+
+async def test_tracked_subprocess_restores_prior_spawn_handle(
+    firmware_controller_factory: FirmwareControllerFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nested spawn restores the outer handle and closes only its own kill handle."""
+    controller = firmware_controller_factory(with_settings=False, with_terminate=True)
+    job = _make_job("j1")
+    outer = _FakeJobObject()
+    inner = _FakeJobObject()
+    prior = SpawnHandle(MagicMock(), outer)  # type: ignore[arg-type]
+    controller.state.spawns[job.job_id] = prior
+    _force_job_object(monkeypatch, inner)
+
+    async with controller._tracked_subprocess(
+        job,
+        sys.executable,
+        "-c",
+        "import sys\nsys.exit(0)\n",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    ) as proc:
+        assert controller.state.spawns[job.job_id].win_job is inner
+        await proc.wait()
+
+    assert controller.state.spawns[job.job_id] is prior
+    assert inner.close_calls == 1
+    assert outer.close_calls == 0
+
+
+async def test_release_lane_slot_closes_spawn_handle(
+    firmware_controller_factory: FirmwareControllerFactory,
+) -> None:
+    """Finalising a job closes a spawn registration left behind by its run."""
+    job = _make_job("j1")
+    controller = firmware_controller_factory(job, with_settings=False, with_terminate=True)
+    fake = _FakeJobObject()
+    controller.state.spawns[job.job_id] = SpawnHandle(MagicMock(), fake)  # type: ignore[arg-type]
+
+    controller._finalize_terminal(job, JobStatus.FAILED)
+
+    assert job.job_id not in controller.state.spawns
+    assert fake.close_calls == 1
 
 
 async def test_tracked_subprocess_gets_devnull_stdin(
@@ -853,11 +933,11 @@ async def test_cancel_in_gap_between_verify_and_main_spawn_terminates(
     _seed_storage(tmp_path, target_platform="ESP32C3")
 
     real = runner_module.create_subprocess_exec
-    terminate_calls: list[asyncio.subprocess.Process | None] = []
+    terminate_calls: list[SpawnHandle | None] = []
     real_terminate = controller._terminate_job_process
 
     async def _spy_terminate(target: FirmwareJob) -> None:
-        terminate_calls.append(controller.state.processes.get(target.job_id))
+        terminate_calls.append(controller.state.spawns.get(target.job_id))
         await real_terminate(target)
 
     monkeypatch.setattr(controller, "_terminate_job_process", _spy_terminate)

@@ -51,6 +51,10 @@ from esphome_device_builder.controllers.firmware.constants import (
 from esphome_device_builder.controllers.remote_build.env_provisioner import EnvProvisionError
 from esphome_device_builder.models import EventType, JobFailureReason, JobStatus
 from tests.controllers.firmware.conftest import (
+    kill_pid,
+    wait_dead,
+)
+from tests.controllers.firmware.conftest import (
     run_until_terminal as _run_until_terminal,
 )
 from tests.controllers.firmware.conftest import (
@@ -311,7 +315,7 @@ async def test_compile_mid_run_cancel_marks_cancelled(
     - JOB_STARTED fires *before* the subprocess spawn (the runner
       flips the status before it ``await``s ``create_subprocess_exec``).
       Synchronising on it would race the spawn and we'd terminate
-      a process that hasn't been registered in ``state.processes``
+      a process that hasn't been registered in ``state.spawns``
       yet. So we wait for the first JOB_OUTPUT instead — that's
       the earliest signal the subprocess is alive AND the
       registry entry has been written.
@@ -344,7 +348,7 @@ async def test_compile_mid_run_cancel_marks_cancelled(
         captured.append({"type": event_type, "data": data})
         # First JOB_OUTPUT line means the subprocess is up,
         # streaming through ``iter_lines_with_progress``, and
-        # ``state.processes[job_id]`` has been registered.
+        # ``state.spawns[job_id]`` has been registered.
         if event_type == EventType.JOB_OUTPUT:
             proc_alive.set()
         elif event_type == EventType.JOB_CANCELLED:
@@ -360,8 +364,8 @@ async def test_compile_mid_run_cancel_marks_cancelled(
         # up the cancel flag when it loops back to read the next
         # line and sees EOF.
         controller.state.cancel_requested.add(job.job_id)
-        assert job.job_id in controller.state.processes
-        controller.state.processes[job.job_id].terminate()
+        assert job.job_id in controller.state.spawns
+        controller.state.spawns[job.job_id].proc.terminate()
 
         # Wait for the cancel event from the runner's natural
         # post-``proc.wait()`` path, NOT from the context exit's
@@ -396,7 +400,7 @@ async def test_execute_job_runner_shutdown_terminates_and_marks_cancelled(
     surrounding runner loop unwinds.
 
     Sequencing: wait for the first JOB_OUTPUT (proves the subprocess
-    is up *and* registered in ``state.processes``) before
+    is up *and* registered in ``state.spawns``) before
     cancelling, otherwise we'd race the subprocess spawn and either
     leak the process or hit the cancel before the try-block had
     entered.
@@ -435,8 +439,8 @@ async def test_execute_job_runner_shutdown_terminates_and_marks_cancelled(
 
     async with running_task(controller._run_queue()) as runner_task:
         await asyncio.wait_for(proc_alive.wait(), timeout=10.0)
-        assert job.job_id in controller.state.processes
-        proc = controller.state.processes[job.job_id]
+        assert job.job_id in controller.state.spawns
+        proc = controller.state.spawns[job.job_id].proc
 
         # Cancel the runner task itself — this is the shutdown shape,
         # not the user-cancel one. Nothing is added to
@@ -545,6 +549,57 @@ async def test_execute_job_runner_shutdown_kills_subprocess_group(
         with suppress(ProcessLookupError):
             os.kill(cpid, 9)
         pytest.fail(f"child {cpid} survived runner-shutdown cancel — group SIGTERM didn't reach it")
+
+
+async def test_user_cancel_kills_process_tree_and_finalizes_promptly(
+    firmware_controller_factory: FirmwareControllerFactory, tmp_path: Path
+) -> None:
+    """``firmware/cancel`` kills the spawn's pipe-holding child too and finalizes in seconds."""
+    controller = firmware_controller_factory(with_queue=True)
+    _wire_real_queue(controller)
+    _fake_esphome(
+        controller,
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen("
+        "[sys.executable, '-c', 'import time; time.sleep(120)'], close_fds=False)\n"
+        "print(f'CHILD_PID={child.pid}', flush=True)\n"
+        "time.sleep(120)\n",
+    )
+    _seed_yaml(tmp_path)
+
+    job = await controller.compile(configuration="kitchen.yaml")
+
+    child_seen = asyncio.Event()
+    cancelled_fired = asyncio.Event()
+    child_pid: list[int] = []
+    real_fire = controller._db.bus.fire
+
+    def _watch(event_type: EventType, data: dict) -> None:
+        if event_type == EventType.JOB_OUTPUT and "CHILD_PID=" in data.get("line", ""):
+            child_pid.append(int(data["line"].split("=", 1)[1].strip()))
+            child_seen.set()
+        if event_type == EventType.JOB_CANCELLED:
+            cancelled_fired.set()
+        real_fire(event_type, data)
+
+    controller._db.bus.fire = _watch
+
+    try:
+        async with running_task(controller._run_queue()):
+            await asyncio.wait_for(child_seen.wait(), timeout=30.0)
+            assert child_pid, "test bug: never read CHILD_PID line"
+
+            await controller.cancel(job_id=job.job_id)
+
+            # Generous CI slack, yet far below the script's 120s runtime.
+            await asyncio.wait_for(cancelled_fired.wait(), timeout=30.0)
+            assert job.status == JobStatus.CANCELLED
+
+            # The whole tree died, not just the tracked parent.
+            await wait_dead(child_pid[0], timeout=10.0)
+    finally:
+        for pid in child_pid:
+            kill_pid(pid)
 
 
 # ---------------------------------------------------------------------------

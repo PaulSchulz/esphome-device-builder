@@ -1,10 +1,11 @@
-"""Stop-button cancellation on Windows uses ``taskkill /F /T``.
+"""Stop-button cancellation on Windows: ``taskkill /F /T`` sweep, then the job object.
 
 The POSIX path (``test_firmware_stop.py``) relies on process groups
 and ``killpg`` — primitives that don't exist on Windows. This module
-covers the Windows-specific branch in ``_terminate_job_process``:
-``taskkill`` walks the kernel's parent-PID tree and force-kills the
-whole subtree in one shot.
+covers the Windows-specific branch in ``_terminate_job_process``: the
+sweep walks the kernel's parent-PID tree first (it alone reaches a
+child spawned before the job assignment landed), then
+``TerminateJobObject`` kills every job member atomically.
 """
 
 from __future__ import annotations
@@ -16,14 +17,20 @@ from unittest.mock import MagicMock
 import pytest
 
 from esphome_device_builder.controllers.firmware import FirmwareController
+from esphome_device_builder.controllers.firmware._state import SpawnHandle
 from esphome_device_builder.helpers import process as process_module
 from esphome_device_builder.helpers.process import _terminate_subtree_windows
 from esphome_device_builder.helpers.subprocess import create_subprocess_exec
-from tests.controllers.firmware.conftest import BareFirmwareControllerFactory
+from esphome_device_builder.helpers.windows_job_object import WindowsJobObject
+from tests.controllers.firmware.conftest import (
+    BareFirmwareControllerFactory,
+    pid_alive,
+    wait_dead,
+)
 
-# Only the integration test below — which spawns a real subprocess
-# and exercises ``_terminate_job_process``'s Windows branch end
-# to end — needs the Windows-only guard. The unit tests for
+# Only the integration tests below — which spawn real subprocesses
+# and exercise ``_terminate_job_process``'s Windows branch end
+# to end — need the Windows-only guard. The unit tests for
 # ``_terminate_subtree_windows`` patch out ``create_subprocess_exec``
 # entirely, so they're cross-platform-safe and contribute Windows-
 # branch coverage on every OS in the matrix.
@@ -42,6 +49,60 @@ def controller(
 
 
 @windows_only
+async def test_terminate_kills_grandchild_via_job_object(
+    controller: FirmwareController,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The job object alone takes down a grandchild when the taskkill sweep fails.
+
+    The spawned parent blocks on stdin until the job assignment has
+    landed, so the grandchild is deterministically a job member; the
+    sweep is forced to fail so only ``TerminateJobObject`` can kill.
+    """
+
+    async def _sweep_fails(_pid: int) -> bool:
+        return False
+
+    monkeypatch.setattr(process_module, "_terminate_subtree_windows", _sweep_fails)
+    proc = await create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import subprocess, sys; "
+        "sys.stdin.readline(); "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        "print(f'GRANDCHILD_PID={child.pid}', flush=True); "
+        "child.wait()",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    win_job = WindowsJobObject.create_for_pid(proc.pid)
+    assert win_job is not None
+    job = MagicMock(job_id="test-job")
+    controller.state.spawns[job.job_id] = SpawnHandle(proc, win_job)
+
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(b"\n")
+        await proc.stdin.drain()
+        assert proc.stdout is not None
+        line = await asyncio.wait_for(proc.stdout.readline(), timeout=10.0)
+        grandchild_pid = int(line.decode().split("=", 1)[1])
+        assert pid_alive(grandchild_pid)
+
+        await controller._terminate_job_process(job)
+
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+        await wait_dead(grandchild_pid)
+    finally:
+        win_job.terminate()
+        win_job.close()
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+
+@windows_only
 async def test_terminate_kills_subprocess_via_taskkill(
     controller: FirmwareController,
 ) -> None:
@@ -54,7 +115,7 @@ async def test_terminate_kills_subprocess_via_taskkill(
         stderr=asyncio.subprocess.STDOUT,
     )
     job = MagicMock(job_id="test-job")
-    controller.state.processes[job.job_id] = proc  # type: ignore[assignment]
+    controller.state.spawns[job.job_id] = SpawnHandle(proc)
 
     try:
         await controller._terminate_job_process(job)

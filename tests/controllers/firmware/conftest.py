@@ -23,7 +23,11 @@ silently absorbing into a stub.
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import sys
 from collections.abc import Callable, Iterator
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -51,7 +55,13 @@ from esphome_device_builder.models import (
     StoredPairing,
 )
 
-from ...conftest import running_task
+from ...conftest import running_task, wait_until
+
+if sys.platform == "win32":
+    import pywintypes
+    import win32api
+    import win32con
+    import win32process
 
 
 class EnqueueStep(StrEnum):
@@ -449,6 +459,41 @@ def seed_yamls(tmp_path: Path, *names: str) -> None:
     for name in names:
         stem = name.removesuffix(".yaml")
         (tmp_path / name).write_text(f"esphome:\n  name: {stem}\n", encoding="utf-8")
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether *pid* is a live process, on either platform."""
+    if sys.platform == "win32":
+        # ``os.kill(pid, 0)`` on Windows is a TerminateProcess, not a
+        # probe — query the exit code through a limited-rights handle.
+        try:
+            handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+        except pywintypes.error:
+            return False
+        try:
+            return win32process.GetExitCodeProcess(handle) == win32con.STILL_ACTIVE
+        finally:
+            handle.Close()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we can't signal it (macOS EPERM).
+        return True
+    return True
+
+
+async def wait_dead(pid: int, timeout: float = 5.0) -> None:
+    """Poll until *pid* exits; pytest-fail naming it on timeout."""
+    await wait_until(lambda: not pid_alive(pid), timeout, f"pid {pid} to exit", interval=0.05)
+
+
+def kill_pid(pid: int) -> None:
+    """Best-effort unconditional kill for test cleanup, on either platform."""
+    sig = signal.SIGTERM if sys.platform == "win32" else signal.SIGKILL
+    with suppress(OSError):
+        os.kill(pid, sig)
 
 
 def attach_device(controller: FirmwareController, configuration: str, state: DeviceState) -> None:
