@@ -16,14 +16,11 @@ from esphome.core import EsphomeError
 from esphome.storage_json import StorageJSON
 
 from ...constants import SECRETS_FILENAME
-
-# Load-bearing direction: controllers.automations (pulled in transitively)
-# must never import helpers.device_yaml, or module load cycles.
-from ...controllers.migrations import has_pending_migrations
 from ...models import Device, DeviceRuntimeState
 from ...models.boards import normalize_platform
 from ..atomic_io import read_text_with_stat
 from ..mac_addresses import derive_interface_macs
+from ..migrations import has_pending_migrations
 from ..storage_path import resolve_storage_path
 from ..validated_config_cache import find_validated_cache, parse_validated_cache
 from ._mqtt_block import build_mqtt_extract
