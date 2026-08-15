@@ -24,9 +24,9 @@ from ..definitions import MigrationRule, load_migration_rules_index
 from ..helpers.yaml.scan import (
     block_end_index,
     child_block_end,
-    find_block_header,
     is_list_item_line,
     leading_ws,
+    top_level_key_index,
     top_list_item_starts,
 )
 from ..models.automations import YamlDiff
@@ -162,29 +162,63 @@ def _apply_action_node_rename(
 # bare-mapping ``ota:`` / ``time:`` form (implicit platform).
 def _apply_generated_renames(lines: list[str]) -> list[str]:
     """Apply the sync-discovered rename rules from the generated artifact."""
-    out = lines
-    rules = load_migration_rules_index()
+    key_rules, block_groups, item_groups = _group_generated_rules(load_migration_rules_index())
+    out = list(lines)
+    headers = top_level_key_index(out)
     # Key respells first, so a same-release field rename inside the
     # renamed block still converges in this single fold pass.
-    for rule in rules:
-        if rule.kind == "component_key":
-            out = _respell_top_level_key(out, rule.old, rule.new)
-    for rule in rules:
-        # No fallthrough: a kind this build doesn't know is a no-op,
-        # never misapplied as some other kind's rename.
-        if rule.kind == "component_block_field":
-            out = _apply_component_block_field(out, rule)
-        elif rule.kind == "platform_item_field":
-            out = _apply_platform_item_field(out, rule)
+    for rule in key_rules:
+        _respell_top_level_key(out, headers, rule.old, rule.new)
+
+    in_scalar: list[bool] | None = None
+
+    def mask() -> list[bool]:
+        # One pass serves every block: the respells below preserve line
+        # count, indentation, and everything after the key.
+        nonlocal in_scalar
+        if in_scalar is None:
+            in_scalar = _block_scalar_mask(out)
+        return in_scalar
+
+    for component, rules in block_groups.items():
+        if (header := headers.get(component)) is not None:
+            _apply_component_block_fields(out, header, rules, mask())
+    for domain, by_platform in item_groups.items():
+        if (header := headers.get(domain)) is not None:
+            _apply_platform_item_fields(out, header, by_platform, mask())
     return out
 
 
-def _apply_component_block_field(lines: list[str], rule: MigrationRule) -> list[str]:
-    """Rename a child key of the top-level ``<component>:`` block, mapping or list form."""
-    header = find_block_header(lines, rule.component)
-    if header is None:
-        return lines
-    in_scalar = _block_scalar_mask(lines)
+def _group_generated_rules(
+    rules: tuple[MigrationRule, ...],
+) -> tuple[
+    list[MigrationRule],
+    dict[str, list[MigrationRule]],
+    dict[str, dict[str, list[MigrationRule]]],
+]:
+    """Split *rules* into key respells, per-component block groups, and per-platform item groups."""
+    key_rules: list[MigrationRule] = []
+    block_groups: dict[str, list[MigrationRule]] = {}
+    item_groups: dict[str, dict[str, list[MigrationRule]]] = {}
+    for rule in rules:
+        # No fallthrough: a kind this build doesn't know is dropped here,
+        # never misapplied as some other kind's rename.
+        if rule.kind == "component_key":
+            key_rules.append(rule)
+        elif rule.kind == "component_block_field":
+            block_groups.setdefault(rule.component, []).append(rule)
+        elif rule.kind == "platform_item_field":
+            item_groups.setdefault(rule.domain, {}).setdefault(rule.platform, []).append(rule)
+    return key_rules, block_groups, item_groups
+
+
+def _apply_component_block_fields(
+    lines: list[str],
+    header: int,
+    rules: list[MigrationRule],
+    in_scalar: list[bool],
+) -> None:
+    """Rename child keys of the top-level block at *header* in place, mapping or list form."""
     end = block_end_index(lines, header)
     # The block's first content line decides its form; a deeper dash
     # inside a mapping body is a nested list, not a multi_conf item.
@@ -200,56 +234,54 @@ def _apply_component_block_field(lines: list[str], rule: MigrationRule) -> list[
         list_form = is_list_item_line(stripped)
         break
     if not list_form:
-        hit = _respell_body_field(lines, header, 0, rule.old, rule.new, in_scalar)
-        if hit is None:
-            return lines
-        out = list(lines)
-        out[hit[0]] = hit[1]
-        return out
-    out = list(lines)
+        for rule in rules:
+            hit = _respell_body_field(lines, header, 0, rule.old, rule.new, in_scalar)
+            if hit is not None:
+                lines[hit[0]] = hit[1]
+        return
     for item_start in top_list_item_starts(lines, header, end):
         keys = _item_child_keys(lines, item_start, end, in_scalar)
-        _respell_item_key(lines, out, keys, rule.old, rule.new)
-    return out
+        for rule in rules:
+            _respell_item_key(lines, keys, rule.old, rule.new)
 
 
-def _apply_platform_item_field(lines: list[str], rule: MigrationRule) -> list[str]:
-    """Rename a child key of the ``- platform: <platform>`` items under ``<domain>:``."""
-    header = find_block_header(lines, rule.domain)
-    if header is None:
-        return lines
+def _apply_platform_item_fields(
+    lines: list[str],
+    header: int,
+    rules_by_platform: dict[str, list[MigrationRule]],
+    in_scalar: list[bool],
+) -> None:
+    """Rename child keys of the ``- platform:`` items in the domain block at *header* in place."""
     end = block_end_index(lines, header)
-    in_scalar = _block_scalar_mask(lines)
-    out = list(lines)
     for item_start in top_list_item_starts(lines, header, end):
         keys = _item_child_keys(lines, item_start, end, in_scalar)
         platform = next(
             (_entry_value(lines[idx], col) for idx, col, key in keys if key == "platform"),
             None,
         )
-        if platform != rule.platform:
+        if platform is None:
             continue
-        _respell_item_key(lines, out, keys, rule.old, rule.new)
-    return out
+        for rule in rules_by_platform.get(platform, ()):
+            _respell_item_key(lines, keys, rule.old, rule.new)
 
 
 def _respell_item_key(
     lines: list[str],
-    out: list[str],
     keys: list[tuple[int, int, str]],
     old: str,
     new: str,
 ) -> None:
-    """Respell a list item's *old* depth-1 key into *out*; no-op on collision or absence."""
+    """Respell an item's *old* depth-1 key in *lines* and *keys*; no-op on collision or absence."""
     if any(key == new for _idx, _col, key in keys):
         return
-    target = next(((idx, col) for idx, col, key in keys if key == old), None)
-    if target is None:
+    slot = next((i for i, (_idx, _col, key) in enumerate(keys) if key == old), None)
+    if slot is None:
         return
-    idx, col = target
+    idx, col, _key = keys[slot]
     content = lines[idx].rstrip("\n\r")
     eol = lines[idx][len(content) :]
-    out[idx] = content[:col] + new + content[col + len(old) :] + eol
+    lines[idx] = content[:col] + new + content[col + len(old) :] + eol
+    keys[slot] = (idx, col, new)
 
 
 #: Upstream's closed ``CLK_MODES_DEPRECATED`` table — anything else is an
@@ -327,18 +359,22 @@ def _child_block_span(
     return None
 
 
-def _respell_top_level_key(lines: list[str], legacy: str, canonical: str) -> list[str]:
+def _respell_top_level_key(
+    lines: list[str],
+    headers: dict[str, int],
+    legacy: str,
+    canonical: str,
+) -> None:
     """
-    Rename the column-0 ``legacy:`` block header to ``canonical:``.
+    Rename the column-0 ``legacy:`` header in place, keeping *headers* current.
 
     No-op when a ``canonical:`` block already exists.
     """
-    idx = find_block_header(lines, legacy)
-    if idx is None or find_block_header(lines, canonical) is not None:
-        return lines
-    out = list(lines)
-    out[idx] = canonical + lines[idx][len(legacy) :]
-    return out
+    idx = headers.get(legacy)
+    if idx is None or canonical in headers:
+        return
+    lines[idx] = canonical + lines[idx][len(legacy) :]
+    headers[canonical] = headers.pop(legacy)
 
 
 def _block_scalar_mask(lines: list[str]) -> list[bool]:
