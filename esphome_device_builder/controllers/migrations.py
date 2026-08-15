@@ -9,13 +9,16 @@ command run against a mid-edit draft that ``automations/parse`` would
 reject. Bespoke rules cover the anchors the generic machinery can't
 express; plain ``cv.rename_key`` pairs arrive data-driven from the
 sync-generated ``migration_rules.index.json``. Exposed as
-``editor/migrate_config``.
+``editor/migrate_config``; ``has_pending_migrations`` feeds the
+per-device dashboard flag at scanner load time.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cache
 
 from ..definitions import MigrationRule, load_migration_rules_index
 from ..helpers.yaml.scan import (
@@ -60,6 +63,8 @@ _ANCHOR_RES = tuple((rename, rename.anchor_re) for rename in _ACTION_NODE_RENAME
 
 _SCALAR_HEADER_RE = re.compile(r"[|>][0-9+-]*\s*$")
 
+_ETHERNET_CLK_MODE_KEY = "clk_mode"
+
 
 def render_migrations(yaml_text: str) -> tuple[str, YamlDiff] | None:
     """
@@ -69,12 +74,29 @@ def render_migrations(yaml_text: str) -> tuple[str, YamlDiff] | None:
     changed span, or ``None`` when nothing needed migrating.
     """
     out = yaml_text.splitlines(keepends=True)
-    for rule in _RULES:
+    for rule, _tokens in _RULES:
         out = rule(out)
     new_text = "".join(out)
     if new_text == yaml_text:
         return None
     return new_text, _build_diff_for_append(yaml_text, new_text)
+
+
+def has_pending_migrations(yaml_text: str) -> bool:
+    """Report whether ``render_migrations`` would change *yaml_text*."""
+    # Fleet-scan hot path: the token scan is ~300x cheaper than the fold.
+    if _legacy_token_re(load_migration_rules_index()).search(yaml_text) is None:
+        return False
+    return render_migrations(yaml_text) is not None
+
+
+@cache
+def _legacy_token_re(rules: tuple[MigrationRule, ...]) -> re.Pattern[str]:
+    """Alternation matching every rule's legacy spelling in key position."""
+    # ``\s*:`` mirrors the loosest matcher (split-on-colon tolerates padding
+    # before the colon) so prose mentions don't force the full fold.
+    tokens = _BESPOKE_LEGACY_TOKENS.union(rule.old for rule in rules)
+    return re.compile("|".join(re.escape(token) + r"\s*:" for token in sorted(tokens)))
 
 
 def _canonicalize_api_actions(lines: list[str]) -> list[str]:
@@ -254,7 +276,7 @@ def _migrate_ethernet_clk(lines: list[str]) -> list[str]:
     if span is None:
         return lines
     start, end, child_indent = span
-    header = child_indent + "clk_mode:"
+    header = child_indent + _ETHERNET_CLK_MODE_KEY + ":"
     for idx in range(start + 1, min(end, len(lines))):
         content = lines[idx].rstrip("\n\r")
         if not content.startswith(header):
@@ -478,9 +500,19 @@ def _entry_value(line: str, col: int) -> str:
     return value
 
 
-_RULES = (
-    _canonicalize_api_actions,
-    _canonicalize_action_nodes,
-    _migrate_ethernet_clk,
-    _apply_generated_renames,
+# Each bespoke rule is paired with the substrings it needs present before it
+# can fire, so a rule can't join the fold without feeding the prefilter; the
+# generated leg's tokens join from the rules index at predicate time.
+_RULES: tuple[tuple[Callable[[list[str]], list[str]], frozenset[str]], ...] = (
+    (
+        _canonicalize_api_actions,
+        frozenset((*api_actions.BLOCK_KEYS[1:], *api_actions.ITEM_KEYS[1:])),
+    ),
+    (
+        _canonicalize_action_nodes,
+        frozenset(t for r in _ACTION_NODE_RENAMES for t in (r.legacy_id, r.legacy_field)),
+    ),
+    (_migrate_ethernet_clk, frozenset((_ETHERNET_CLK_MODE_KEY,))),
+    (_apply_generated_renames, frozenset()),
 )
+_BESPOKE_LEGACY_TOKENS = frozenset().union(*(tokens for _, tokens in _RULES))
