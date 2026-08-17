@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from script.sync_components import (  # type: ignore[import-not-found]
+import script.sync_components as sc  # type: ignore[import-not-found]
+from script.sync_components import (
     _assert_docs_urls_valid,
     _docs_page_path,
     _repair_help_links,
@@ -155,11 +156,56 @@ def test_repair_help_links_repoints_dead_page_to_component_url() -> None:
             {"key": "c", "help_link": "https://esphome.io/automations/actions#z"},
         ],
     }
-    _repair_help_links([component], {"sensor/xiaomi_ble": ""})
+    _repair_help_links([component], {"sensor/xiaomi_ble": "## LYWSD03MMC\n\n## Y\n"})
     entries = component["config_entries"]
     assert entries[0]["help_link"] == "https://esphome.io/components/sensor/xiaomi_ble#lywsd03mmc"
     assert entries[1]["help_link"] == "https://esphome.io/components/sensor/xiaomi_ble#y"
     assert entries[2]["help_link"] == "https://esphome.io/automations/actions#z"
+
+
+def test_repair_help_links_repoint_strips_dead_fallback_anchor() -> None:
+    component = {
+        "id": "sensor.atc_mithermometer",
+        "docs_url": "https://esphome.io/components/sensor/xiaomi_ble#gone",
+        "config_entries": [
+            {"key": "a", "help_link": "https://esphome.io/components/sensor/atc_mithermometer#x"}
+        ],
+    }
+    _repair_help_links([component], {"sensor/xiaomi_ble": "## Y\n"})
+    assert (
+        component["config_entries"][0]["help_link"]
+        == "https://esphome.io/components/sensor/xiaomi_ble"
+    )
+
+
+def test_repair_help_links_remaps_stale_fragment_spelling() -> None:
+    component = {
+        "id": "water_heater",
+        "docs_url": "",
+        "config_entries": [
+            {
+                "key": "a",
+                "help_link": "https://esphome.io/components/water_heater#water_heatercontrol-action",
+            }
+        ],
+    }
+    _repair_help_links([component], {"water_heater": "## `water_heater.control` Action\n"})
+    assert (
+        component["config_entries"][0]["help_link"]
+        == "https://esphome.io/components/water_heater#water_heater-control-action"
+    )
+
+
+def test_repair_help_links_strips_dead_anchor_on_live_page() -> None:
+    component = {
+        "id": "sensor.dht",
+        "docs_url": "https://esphome.io/components/sensor/dht",
+        "config_entries": [
+            {"key": "name", "help_link": "https://esphome.io/components/light#optional-variables"}
+        ],
+    }
+    _repair_help_links([component], {"light": "## Effects\n", "sensor/dht": ""})
+    assert component["config_entries"][0]["help_link"] == "https://esphome.io/components/light"
 
 
 def test_repair_help_links_drops_link_when_component_has_no_page() -> None:
@@ -193,13 +239,27 @@ def test_assert_raises_on_dead_help_link_page() -> None:
         _assert_docs_urls_valid(entries, {"light": _XIAOMI_PAGE})
 
 
-def test_assert_ignores_help_link_anchors_and_non_component_links() -> None:
+def test_assert_raises_on_dead_help_link_anchor() -> None:
     entries = [
         {
             "id": "a",
             "docs_url": "",
             "config_entries": [
-                {"key": "f", "help_link": "https://esphome.io/components/light#fabricated-anchor"},
+                {"key": "f", "help_link": "https://esphome.io/components/light#fabricated-anchor"}
+            ],
+        }
+    ]
+    with pytest.raises(SystemExit, match="no such anchor"):
+        _assert_docs_urls_valid(entries, {"light": _XIAOMI_PAGE})
+
+
+def test_assert_ignores_non_component_help_links() -> None:
+    entries = [
+        {
+            "id": "a",
+            "docs_url": "",
+            "config_entries": [
+                {"key": "f", "help_link": "https://esphome.io/components/light#lywsd03mmc"},
                 {"key": "g", "help_link": "https://esphome.io/automations/actions#x"},
             ],
         }
@@ -210,3 +270,22 @@ def test_assert_ignores_help_link_anchors_and_non_component_links() -> None:
 def test_blockquote_code_span_mention_does_not_rescue() -> None:
     pages = {"esphome": "> Creators can provide `dashboard_import` URL for end users.\n"}
     assert _resolve_docs_url("", "dashboard_import", pages) == ("", None)
+
+
+def test_assert_curated_help_links_pass_when_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sc, "_UART_DEBUG_OVERRIDE", {"help_link": "https://esphome.io/components/uart#debugging"}
+    )
+    monkeypatch.setattr(sc, "_FIELD_OVERRIDES", {})
+    sc._assert_curated_help_links_valid({"uart": "## Debugging\n"})
+
+
+def test_assert_curated_help_links_raise_on_stale_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sc,
+        "_FIELD_OVERRIDES",
+        {("x", "y"): {"nested": [{"help_link": "https://esphome.io/components/uart#gone"}]}},
+    )
+    monkeypatch.setattr(sc, "_UART_DEBUG_OVERRIDE", {})
+    with pytest.raises(SystemExit, match="curated help_link"):
+        sc._assert_curated_help_links_valid({"uart": "## Debugging\n"})

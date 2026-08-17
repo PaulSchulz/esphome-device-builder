@@ -351,7 +351,7 @@ _UART_DEBUG_OVERRIDE: dict[str, Any] = {
         "Bare `debug:` enables hex logging with sensible defaults."
     ),
     "advanced": False,
-    "help_link": "https://esphome.io/components/uart#uart-debugging",
+    "help_link": "https://esphome.io/components/uart#debugging",
     "config_entries": [
         {
             "key": "direction",
@@ -364,7 +364,7 @@ _UART_DEBUG_OVERRIDE: dict[str, Any] = {
                 {"label": "RX", "value": "RX"},
                 {"label": "TX", "value": "TX"},
             ],
-            "help_link": "https://esphome.io/components/uart#uart-debugging",
+            "help_link": "https://esphome.io/components/uart#debugging",
         },
         {
             "key": "debug_prefix",
@@ -375,7 +375,7 @@ _UART_DEBUG_OVERRIDE: dict[str, Any] = {
                 "when multiple UART buses log at the same time."
             ),
             "default_value": "",
-            "help_link": "https://esphome.io/components/uart#uart-debugging",
+            "help_link": "https://esphome.io/components/uart#debugging",
         },
         {
             "key": "dummy_receiver",
@@ -387,7 +387,7 @@ _UART_DEBUG_OVERRIDE: dict[str, Any] = {
             ),
             "default_value": False,
             "advanced": True,
-            "help_link": "https://esphome.io/components/uart#uart-debugging",
+            "help_link": "https://esphome.io/components/uart#debugging",
         },
         {
             "key": "after",
@@ -395,7 +395,7 @@ _UART_DEBUG_OVERRIDE: dict[str, Any] = {
             "label": "After",
             "description": "When to flush accumulated bytes to the log.",
             "advanced": True,
-            "help_link": "https://esphome.io/components/uart#uart-debugging",
+            "help_link": "https://esphome.io/components/uart#debugging",
             "config_entries": [
                 {
                     "key": "bytes",
@@ -405,7 +405,7 @@ _UART_DEBUG_OVERRIDE: dict[str, Any] = {
                         "Flush after this many bytes have been accumulated. Defaults to 150."
                     ),
                     "default_value": 150,
-                    "help_link": "https://esphome.io/components/uart#uart-debugging",
+                    "help_link": "https://esphome.io/components/uart#debugging",
                 },
                 {
                     "key": "timeout",
@@ -415,14 +415,14 @@ _UART_DEBUG_OVERRIDE: dict[str, Any] = {
                         "Flush after no bytes have been seen for this long. Defaults to `100ms`."
                     ),
                     "default_value": "100ms",
-                    "help_link": "https://esphome.io/components/uart#uart-debugging",
+                    "help_link": "https://esphome.io/components/uart#debugging",
                 },
                 {
                     "key": "delimiter",
                     "type": "string",
                     "label": "Delimiter",
                     "description": ("Flush as soon as this byte sequence is seen in the stream."),
-                    "help_link": "https://esphome.io/components/uart#uart-debugging",
+                    "help_link": "https://esphome.io/components/uart#debugging",
                 },
             ],
         },
@@ -1371,6 +1371,10 @@ def build_catalog(
     # see a fragment.
     _attach_docs_anchors(out, _load_docs_page_index())
 
+    # Curated tables are checked at their home: the entry repair below
+    # would silently heal a stale hand-written link.
+    _assert_curated_help_links_valid(_load_docs_page_index())
+
     # After the anchor pass so the fallback help_link is the final URL.
     _repair_help_links(out, _load_docs_page_index())
 
@@ -1515,57 +1519,125 @@ def _iter_config_entries(config_entries: list[dict]) -> Iterator[dict]:
         yield from _iter_config_entries(entry.get("config_entries") or [])
 
 
+def _link_status(url: str, pages: Mapping[str, str]) -> tuple[str, str, str]:
+    """
+    Classify a docs link against the page tree: ``(status, page_path, fragment)``.
+
+    Status is ``non_component`` (not a ``/components/`` URL), ``ok``,
+    ``dead_page``, or ``dead_anchor``.
+    """
+    path = _docs_page_path(url)
+    if path is None:
+        return "non_component", "", ""
+    fragment = url.split("#", 1)[1] if "#" in url else ""
+    if path not in pages:
+        return "dead_page", path, fragment
+    if fragment and fragment not in _page_anchor_set(pages[path]):
+        return "dead_anchor", path, fragment
+    return "ok", path, fragment
+
+
 def _repair_help_links(entries: list[dict], pages: Mapping[str, str]) -> None:
     """
-    Repoint or drop per-field help_links whose docs page doesn't exist.
+    Repair per-field help_links naming a docs page or anchor that doesn't exist.
 
-    A dead components-page link falls back to the component's own resolved
-    ``docs_url``; with no page at all the key is dropped. Links outside
-    ``/components/`` pass through untouched.
+    A dead page falls back to the component's own resolved ``docs_url`` (the
+    key is dropped when there is none); a dead anchor on a live page remaps
+    to the unique live anchor with the same alphanumerics, else strips to the
+    bare page. Links outside ``/components/`` pass through untouched.
     """
-    repointed = dropped = 0
+    repointed = dropped = remapped = stripped = 0
     for component in entries:
         fallback = component.get("docs_url") or ""
         for entry in _iter_config_entries(component.get("config_entries") or []):
             link = entry.get("help_link") or ""
-            path = _docs_page_path(link)
-            if path is None or path in pages:
-                continue
-            if fallback:
-                entry["help_link"] = fallback
+            status, path, fragment = _link_status(link, pages)
+            if status == "dead_page":
+                if not fallback:
+                    del entry["help_link"]
+                    dropped += 1
+                    continue
+                link = fallback
+                entry["help_link"] = link
                 repointed += 1
+                status, path, fragment = _link_status(link, pages)
+            if status != "dead_anchor":
+                continue
+            anchor = _remap_stale_fragment(fragment, _page_anchor_set(pages[path]))
+            if anchor:
+                entry["help_link"] = f"{_strip_anchor(link)}#{anchor}"
+                remapped += 1
             else:
-                del entry["help_link"]
-                dropped += 1
-    if repointed or dropped:
+                entry["help_link"] = _strip_anchor(link)
+                stripped += 1
+    if repointed or dropped or remapped or stripped:
         _LOGGER.info(
-            "Help links on dead docs pages: repointed %d to the component page, dropped %d",
+            "Repaired help links: %d repointed to the component page, %d dropped, "
+            "%d stale anchors remapped, %d dead anchors stripped",
             repointed,
             dropped,
+            remapped,
+            stripped,
         )
 
 
-def _assert_docs_urls_valid(entries: list[dict], pages: Mapping[str, str]) -> None:
-    """
-    Fail the sync when a docs_url names a missing page or anchor.
+def _slug_norm(s: str) -> str:
+    """Slug-comparison key: lowercase alphanumerics only."""
+    return re.sub(r"[^a-z0-9]", "", s.lower())
 
-    Also checks every per-field help_link's page; help_link anchors are
-    not checked.
-    """
+
+@cache
+def _remap_stale_fragment(fragment: str, anchors: frozenset[str]) -> str | None:
+    """Find the unique live anchor sharing *fragment*'s alphanumerics, else None."""
+    norm = _slug_norm(fragment)
+    hits = [a for a in anchors if _slug_norm(a) == norm]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _assert_curated_help_links_valid(pages: Mapping[str, str]) -> None:
+    """Fail the sync when a hand-written override help_link names a dead page or anchor."""
+
+    def walk(obj: Any) -> Iterator[str]:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key == "help_link" and isinstance(value, str):
+                    yield value
+                else:
+                    yield from walk(value)
+        elif isinstance(obj, (list, tuple)):
+            for value in obj:
+                yield from walk(value)
+
+    # Discovered from the module globals so a new override table is
+    # covered on arrival.
+    bad = [
+        f"{name}: {link} ({status})"
+        for name, obj in globals().items()
+        if isinstance(obj, (dict, list, tuple))
+        for link in walk(obj)
+        if (status := _link_status(link, pages)[0]) in ("dead_page", "dead_anchor")
+    ]
+    if bad:
+        raise SystemExit("curated help_link validation failed:\n  " + "\n  ".join(bad))
+
+
+def _assert_docs_urls_valid(entries: list[dict], pages: Mapping[str, str]) -> None:
+    """Fail the sync when a docs_url or help_link names a missing page or anchor."""
+
+    def check(owner: str, url: str, *, require_components: bool = False) -> None:
+        if not url:
+            return
+        status = _link_status(url, pages)[0]
+        if status == "dead_page" or (status == "non_component" and require_components):
+            bad.append(f"{owner}: {url} (no such docs page)")
+        elif status == "dead_anchor":
+            bad.append(f"{owner}: {url} (no such anchor)")
+
     bad: list[str] = []
     for entry in entries:
-        url = entry.get("docs_url") or ""
-        if url:
-            path = _docs_page_path(url)
-            if path is None or path not in pages:
-                bad.append(f"{entry['id']}: {url} (no such docs page)")
-            elif "#" in url and url.split("#", 1)[1] not in _page_anchor_set(pages[path]):
-                bad.append(f"{entry['id']}: {url} (no such anchor)")
+        check(entry["id"], entry.get("docs_url") or "", require_components=True)
         for centry in _iter_config_entries(entry.get("config_entries") or []):
-            link = centry.get("help_link") or ""
-            lpath = _docs_page_path(link)
-            if lpath is not None and lpath not in pages:
-                bad.append(f"{entry['id']}: help_link {link} (no such docs page)")
+            check(f"{entry['id']} help_link", centry.get("help_link") or "")
     if bad:
         raise SystemExit("docs_url validation failed:\n  " + "\n  ".join(bad))
 
@@ -2133,14 +2205,11 @@ def _docs_page_path(url: str) -> str | None:
     return m.group(1).strip("/")
 
 
-def _iter_deduped_headings(
-    body: str, slugify: Callable[[str], str] | None = None
-) -> Iterator[tuple[re.Match[str], str]]:
+def _iter_deduped_headings(body: str) -> Iterator[tuple[re.Match[str], str]]:
     """H2-H4 heading matches of a frontmatter-stripped body with docs-site ``-N`` slug dedup."""
-    slugify = slugify or _slugify_heading
     slug_seen: dict[str, int] = {}
     for m in _MDX_HEADING.finditer(body):
-        base = slugify(m.group("title").strip())
+        base = _docs_site_slug(m.group("title").strip())
         n = slug_seen.get(base, 0)
         slug_seen[base] = n + 1
         yield m, base if n == 0 else f"{base}-{n}"
@@ -2172,7 +2241,7 @@ def _page_anchor_index(text: str) -> tuple[list[tuple[int, str]], frozenset[str]
     ``<a id>`` tags.
     """
     body = _strip_mdx_frontmatter(text)
-    headings = [(m.start(), slug) for m, slug in _iter_deduped_headings(body, _docs_site_slug)]
+    headings = [(m.start(), slug) for m, slug in _iter_deduped_headings(body)]
     explicit = frozenset(re.findall(r'<(?:span|a)\s+id="([^"]+)"', body))
     return headings, explicit
 
@@ -2453,13 +2522,6 @@ _NONFIELD_ENTRY_TYPES = frozenset({"nested", "map", "divider", "label", "alert"}
 # this many non-generic names and cover at least this fraction of both sides.
 _MIN_SHARED_NONGENERIC = 2
 _MIN_SECTION_COVERAGE = 0.5
-
-
-def _slugify_heading(heading: str) -> str:
-    """GitHub-slugger-style anchor for a docs heading (backticks stripped)."""
-    slug = heading.replace("`", "").lower()
-    slug = re.sub(r"[^a-z0-9]+", "-", slug)
-    return slug.strip("-")
 
 
 def _enumerate_mdx_field_sections(text: str) -> list[dict]:
