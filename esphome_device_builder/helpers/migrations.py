@@ -324,6 +324,12 @@ def _fold_channel_colors_items(
     out = list(lines)
     # Last item first, so earlier items' line indexes stay valid in *out*.
     for item_start in reversed(top_list_item_starts(lines, header, end)):
+        # An anchored item may be merged into a sibling via ``<<:``;
+        # folding it would hand that sibling the channel_colors-plus-
+        # legacy-key combination upstream rejects. The anchor sits on
+        # the dash line, or on a bare dash's first content line.
+        if _item_is_anchored(lines, item_start, end):
+            continue
         keys = _item_child_keys(lines, item_start, end, in_scalar)
         # A merge key (``<<``) or quoted key hides fields from this
         # depth-1 view; folding a partial item would emit the
@@ -356,6 +362,31 @@ def _fold_channel_colors_items(
     return out
 
 
+def _item_is_anchored(lines: list[str], item_start: int, end: int) -> bool:
+    """Report whether the list item at *item_start* carries a ``&`` anchor."""
+    rest = lines[item_start].lstrip(" ")[1:].lstrip(" ")
+    if _leads_with_anchor(rest):
+        return True
+    if rest.rstrip("\n\r"):
+        return False
+    for idx in range(item_start + 1, min(end, len(lines))):
+        stripped = lines[idx].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return _leads_with_anchor(stripped)
+    return False
+
+
+def _leads_with_anchor(text: str) -> bool:
+    """Report whether *text* opens with a ``&`` anchor, tags allowed before it."""
+    for token in text.split():
+        if token.startswith("&"):
+            return True
+        if not token.startswith("!"):
+            return False
+    return False
+
+
 def _fold_channel_colors(
     lines: list[str],
     entries: dict[str, tuple[int, int]],
@@ -367,7 +398,8 @@ def _fold_channel_colors(
     closed tables (the config must keep failing validation loudly).
     """
     order = entries.get("rgb_order")
-    if order is None or "channel_colors" in entries:
+    # ``rgbw_order`` existed only in 2026.8 betas.
+    if order is None or "channel_colors" in entries or "rgbw_order" in entries:
         return None
     flags: list[bool] = []
     delete: list[int] = []
