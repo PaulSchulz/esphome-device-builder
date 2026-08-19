@@ -48,6 +48,9 @@ _VALIDATE_CACHE_TTL = 60.0
 # user leaves.
 _IDLE_SUBPROCESS_TIMEOUT = 600.0
 _REAP_INTERVAL = 60.0
+# Below this remaining budget a raced re-run is near-certain to time out;
+# skip it and return the raced result uncached instead.
+_MIN_RERUN_BUDGET = 1.0
 # ``_EditorSession.source_fingerprint`` sentinel that matches no real
 # digest, so the next validate respawns the subprocess.
 _STALE_SOURCES = "stale"
@@ -373,6 +376,29 @@ class EditorController:
             cached = session.cached
             if cached is not None and cached.is_fresh_for(content_hash):
                 return cached.result
+            return await self._validate_with_retry(
+                session, configuration, content, content_hash, timeout
+            )
+
+    async def _validate_with_retry(
+        self,
+        session: _EditorSession,
+        configuration: str,
+        content: str,
+        content_hash: int,
+        timeout: float,
+    ) -> dict:
+        """
+        Run the validation round-trip, re-running once when a config-dir write races it.
+
+        Caller must hold ``session.lock``. The re-run gets whatever is
+        left of *timeout* (round-trip only; subprocess startup stays
+        outside the budget); a re-run failure falls back to the first
+        attempt's verdict, returned uncached.
+        """
+        remaining = timeout
+        result: dict[str, Any] | None = None
+        for retry_left in (True, False):
             ok = False
             epoch = session.invalidation_epoch
             try:
@@ -381,23 +407,49 @@ class EditorController:
                 await self._ensure_subprocess(
                     session, extract_component_source_fingerprint(content)
                 )
-                result = await asyncio.wait_for(
+                round_trip_started = time.monotonic()
+                attempt = await asyncio.wait_for(
                     self._validate_locked(session, configuration, content),
-                    timeout=timeout,
+                    timeout=remaining,
                 )
+                remaining -= time.monotonic() - round_trip_started
+                result = attempt
                 ok = True
+                if session.invalidation_epoch == epoch:
+                    session.cached = _CachedValidation(
+                        content_hash=content_hash, result=attempt, at=time.monotonic()
+                    )
+                    break
+            except (TimeoutError, ValidatorUnavailableError, OSError) as err:
+                # A failed re-run must not turn the first attempt's
+                # verdict into an error; return it uncached instead.
+                if result is None:
+                    raise
+                _LOGGER.warning(
+                    "Re-validation of %s failed (%r); returning the pre-write result",
+                    configuration,
+                    err,
+                )
+                break
             finally:
                 # Any failure (timeout, subprocess loss, a bug, cancellation)
                 # can leave the stateful stdin/stdout protocol mid-message;
-                # kill it so the next call respawns clean. The exception (typed
-                # for callers) propagates unchanged.
+                # kill it so the next call respawns clean. A first-attempt
+                # exception (typed for callers) propagates unchanged.
                 if not ok:
                     await self._terminate_subprocess(session)
-            if session.invalidation_epoch == epoch:
-                session.cached = _CachedValidation(
-                    content_hash=content_hash, result=result, at=time.monotonic()
-                )
-            return result
+            if retry_left and remaining > _MIN_RERUN_BUDGET:
+                _LOGGER.debug("Validate of %s raced a config-dir write; re-running", configuration)
+                continue
+            _LOGGER.info(
+                "Validate of %s raced a config-dir write; %s, returning the raced result uncached",
+                configuration,
+                "budget exhausted" if retry_left else "raced again",
+            )
+            break
+        if result is None:  # pragma: no cover — attempt one either raises or sets result
+            raise ValidatorUnavailableError("validator produced no result")
+        return result
 
     async def _validate_locked(
         self, session: _EditorSession, configuration: str, content: str
